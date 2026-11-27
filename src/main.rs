@@ -7,6 +7,7 @@ mod history;
 mod keys;
 mod model;
 mod notify;
+mod ocr;
 mod portal;
 mod search;
 mod settings;

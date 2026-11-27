@@ -82,6 +82,8 @@ pub struct Settings {
     pub notification_shows_content: bool,
     pub close_after_copy: bool,
     pub search_mode: SearchMode,
+    /// Recognize text in copied images so they can be searched (needs Tesseract).
+    pub recognize_text: bool,
     /// Register a global shortcut through the desktop portal (opt-in).
     pub global_shortcut: bool,
     /// Preferred trigger for that shortcut, in GTK accelerator syntax.
@@ -122,6 +124,7 @@ impl Default for Settings {
             notification_shows_content: true,
             close_after_copy: true,
             search_mode: SearchMode::Exact,
+            recognize_text: true,
             global_shortcut: false,
             popup_shortcut: "<Shift><Super>c".into(),
             save_text: true,

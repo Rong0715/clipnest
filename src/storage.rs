@@ -43,9 +43,19 @@ impl Storage {
                hash INTEGER NOT NULL,
                data BLOB NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS contents_item ON contents(item_id);
-             PRAGMA user_version = 1;",
+             CREATE INDEX IF NOT EXISTS contents_item ON contents(item_id);",
         )?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            // v2: text recognized in images.
+            let has_column = conn
+                .prepare("SELECT ocr_text FROM items LIMIT 0")
+                .is_ok();
+            if !has_column {
+                conn.execute_batch("ALTER TABLE items ADD COLUMN ocr_text TEXT;")?;
+            }
+            conn.execute_batch("PRAGMA user_version = 2;")?;
+        }
         Ok(Storage { conn, path: path.to_owned() })
     }
 
@@ -59,7 +69,7 @@ impl Storage {
                 "PRAGMA foreign_keys = ON;
                  CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', application TEXT,
                    first_copied_at INTEGER NOT NULL, last_copied_at INTEGER NOT NULL,
-                   number_of_copies INTEGER NOT NULL DEFAULT 1, pin TEXT);
+                   number_of_copies INTEGER NOT NULL DEFAULT 1, pin TEXT, ocr_text TEXT);
                  CREATE TABLE contents (id INTEGER PRIMARY KEY,
                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
                    mime TEXT NOT NULL, size INTEGER NOT NULL, hash INTEGER NOT NULL, data BLOB NOT NULL);",
@@ -72,7 +82,7 @@ impl Storage {
         let mut items: Vec<Item> = Vec::new();
         let mut index: HashMap<i64, usize> = HashMap::new();
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, application, first_copied_at, last_copied_at, number_of_copies, pin FROM items",
+            "SELECT id, title, application, first_copied_at, last_copied_at, number_of_copies, pin, ocr_text FROM items",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Item {
@@ -84,6 +94,7 @@ impl Storage {
                 last_copied_at: row.get(4)?,
                 number_of_copies: row.get(5)?,
                 pin: row.get(6)?,
+                ocr_text: row.get(7)?,
             })
         })?;
         for item in rows {
@@ -139,15 +150,16 @@ impl Storage {
     pub fn insert_item(&self, item: &mut Item) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO items (title, application, first_copied_at, last_copied_at, number_of_copies, pin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO items (title, application, first_copied_at, last_copied_at, number_of_copies, pin, ocr_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 item.title,
                 item.application,
                 item.first_copied_at,
                 item.last_copied_at,
                 item.number_of_copies,
-                item.pin
+                item.pin,
+                item.ocr_text
             ],
         )?;
         item.id = tx.last_insert_rowid();
@@ -165,7 +177,7 @@ impl Storage {
     pub fn update_item(&self, item: &Item) -> Result<()> {
         self.conn.execute(
             "UPDATE items SET title = ?2, application = ?3, first_copied_at = ?4, last_copied_at = ?5,
-                    number_of_copies = ?6, pin = ?7 WHERE id = ?1",
+                    number_of_copies = ?6, pin = ?7, ocr_text = ?8 WHERE id = ?1",
             params![
                 item.id,
                 item.title,
@@ -173,7 +185,8 @@ impl Storage {
                 item.first_copied_at,
                 item.last_copied_at,
                 item.number_of_copies,
-                item.pin
+                item.pin,
+                item.ocr_text
             ],
         )?;
         Ok(())

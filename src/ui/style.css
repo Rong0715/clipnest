@@ -57,6 +57,13 @@ row:selected .clipnest-shortcut {
   background: none;
 }
 
+.clipnest-ocr {
+  font-size: 0.95em;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: alpha(currentColor, 0.06);
+}
+
 .clipnest-preview picture {
   border-radius: 6px;
 }

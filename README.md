@@ -24,6 +24,9 @@ something is copied, and gives you a window to search, copy back, pin and delete
   copies without formatting, Ctrl+1…9 copy the first nine items and Ctrl+&lt;key&gt; copies a
   pinned item.
 - Text, rich text (HTML/RTF), images and copied files.
+- **Search text in images** — text in copied screenshots and pictures is recognized on your
+  computer (Tesseract, any installed language) so you can search for it; *Copy Plain* on an
+  image copies its text.
 - Ignore lists: password-manager hints (KeePassXC etc.), custom clipboard types, regular
   expressions, and X11 applications.
 - Pause, "ignore next copy", history size limit, sort order.
@@ -38,6 +41,13 @@ Build requirements on Ubuntu/Debian:
 
 ```sh
 sudo apt install cargo build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+```
+
+Optional, to search text inside images (add more `tesseract-ocr-*` language packs as you
+like, e.g. `tesseract-ocr-chi-sim`):
+
+```sh
+sudo apt install tesseract-ocr
 ```
 
 Then build and install for your user only (into `~/.local`, no root needed):

@@ -182,6 +182,21 @@ fn general_page(dialog: &adw::PreferencesDialog) -> adw::PreferencesPage {
         |s, v| s.close_after_copy = v,
     ));
     window.add(&combo("Search", &SearchMode::ALL, SearchMode::label, |s| s.search_mode, |s, v| s.search_mode = v));
+    let langs = app().ocr_langs.borrow().clone().or_else(crate::ocr::languages);
+    let ocr = switch(
+        "Search text in images",
+        None,
+        |s| s.recognize_text,
+        |s, v| s.recognize_text = v,
+    );
+    match langs {
+        Some(l) => ocr.set_subtitle(&format!("Recognized on this computer with Tesseract ({l})")),
+        None => {
+            ocr.set_subtitle("Install the tesseract-ocr package to enable this");
+            ocr.set_sensitive(false);
+        }
+    }
+    window.add(&ocr);
     p.add(&window);
 
     let shortcut = adw::PreferencesGroup::builder()

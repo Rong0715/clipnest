@@ -150,6 +150,21 @@ impl History {
         Added::New(id)
     }
 
+    /// Image items whose text has not been recognized yet, newest first.
+    pub fn pending_ocr(&self) -> Vec<i64> {
+        let mut items: Vec<&Item> = self.items.iter().filter(|i| i.is_image_item() && i.ocr_text.is_none()).collect();
+        items.sort_by(|a, b| b.last_copied_at.cmp(&a.last_copied_at));
+        items.iter().map(|i| i.id).collect()
+    }
+
+    pub fn set_ocr_text(&mut self, id: i64, text: String) {
+        if let Some(pos) = self.position(id) {
+            self.items[pos].ocr_text = Some(text);
+            let item = self.items[pos].clone();
+            self.save(&item);
+        }
+    }
+
     /// Selecting an item from the popup counts as copying it again.
     pub fn bump(&mut self, id: i64) {
         if let Some(pos) = self.position(id) {

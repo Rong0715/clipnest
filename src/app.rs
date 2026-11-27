@@ -12,6 +12,7 @@ use crate::config::{self, APP_ID};
 use crate::history::{Added, History};
 use crate::model::{self, Content, Kind};
 use crate::notify::Notifier;
+use crate::ocr::Ocr;
 use crate::portal::GlobalShortcuts;
 use crate::settings::Settings;
 use crate::tray::{MenuEntry, Tray};
@@ -32,6 +33,9 @@ pub struct App {
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     regexes: RefCell<Vec<regex::Regex>>,
     last_copied: Cell<Option<i64>>,
+    ocr: RefCell<Option<Ocr>>,
+    /// Tesseract languages in use, when text recognition is running.
+    pub ocr_langs: RefCell<Option<String>>,
     /// PNG thumbnail + size of image items, for the tray menu.
     tray_thumbs: RefCell<std::collections::HashMap<i64, Option<(Rc<Vec<u8>>, i32, i32)>>>,
 }
@@ -65,6 +69,8 @@ pub fn run() -> glib::ExitCode {
         hold: RefCell::new(None),
         regexes: RefCell::new(Vec::new()),
         last_copied: Cell::new(None),
+        ocr: RefCell::new(None),
+        ocr_langs: RefCell::new(None),
         tray_thumbs: RefCell::new(std::collections::HashMap::new()),
     });
     APP.with(|a| *a.borrow_mut() = Some(instance));
@@ -104,6 +110,9 @@ impl App {
         // Keep running in the background to watch the clipboard.
         *self.hold.borrow_mut() = Some(self.gtk_app.hold());
         self.start_clipboard();
+        if self.settings.borrow().recognize_text {
+            self.start_ocr();
+        }
         self.update_tray();
         if self.settings.borrow().global_shortcut {
             self.bind_global_shortcut(false);
@@ -386,6 +395,7 @@ impl App {
         let id = match added {
             Added::New(id) | Added::Existing(id) => id,
         };
+        self.queue_ocr(id);
         self.history_changed();
         if s.notify_on_copy {
             self.notify_item("Copied", id);
@@ -424,6 +434,16 @@ impl App {
 
     /// Puts a history item back on the clipboard.
     pub fn copy_item(self: &Rc<Self>, id: i64, plain: bool) {
+        // "Copy plain" on a picture copies the text recognized in it.
+        let image_text = {
+            let history = self.history.borrow();
+            history.get(id).filter(|i| plain && i.is_image_item()).and_then(|i| i.ocr_text.clone())
+        };
+        if let Some(text) = image_text.filter(|t| !t.is_empty()) {
+            self.send(Command::SetClipboard(vec![(model::MIME_TEXT.to_owned(), Arc::new(text.into_bytes()))]));
+            self.last_copied.set(Some(id));
+            return;
+        }
         let contents = self.history.borrow().clipboard_contents(id, plain);
         if contents.is_empty() {
             return;
@@ -455,6 +475,53 @@ impl App {
         let (Added::New(id) | Added::Existing(id)) = added;
         self.last_copied.set(Some(id));
         self.history_changed();
+    }
+
+    // ---- text recognition -------------------------------------------------
+
+    fn start_ocr(self: &Rc<Self>) {
+        if self.ocr.borrow().is_some() {
+            return;
+        }
+        let Some((ocr, results, langs)) = Ocr::start() else {
+            crate::debug!("tesseract not found; images won't be searchable");
+            return;
+        };
+        crate::debug!("recognizing text in images with tesseract ({langs})");
+        *self.ocr.borrow_mut() = Some(ocr);
+        *self.ocr_langs.borrow_mut() = Some(langs);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            while let Ok((id, text)) = results.recv().await {
+                let Some(app) = weak.upgrade() else { break };
+                app.history.borrow_mut().set_ocr_text(id, text);
+                if let Some(w) = app.window() {
+                    w.refresh();
+                }
+            }
+        });
+        let pending = self.history.borrow().pending_ocr();
+        for id in pending {
+            self.queue_ocr(id);
+        }
+    }
+
+    fn stop_ocr(&self) {
+        self.ocr.borrow_mut().take();
+        self.ocr_langs.borrow_mut().take();
+    }
+
+    fn queue_ocr(&self, id: i64) {
+        let ocr = self.ocr.borrow();
+        let Some(ocr) = ocr.as_ref() else { return };
+        let image = {
+            let history = self.history.borrow();
+            let Some(item) = history.get(id).filter(|i| i.is_image_item() && i.ocr_text.is_none()) else { return };
+            item.image_content().and_then(|c| history.content_data(c)).map(|d| d.to_vec())
+        };
+        if let Some(image) = image {
+            ocr.queue(id, image);
+        }
     }
 
     pub fn toggle_pin(self: &Rc<Self>, id: i64) {
@@ -563,6 +630,13 @@ impl App {
         if old.image_max_height != new.image_max_height {
             if let Some(w) = self.window() {
                 w.clear_thumbnails();
+            }
+        }
+        if old.recognize_text != new.recognize_text {
+            if new.recognize_text {
+                self.start_ocr();
+            } else {
+                self.stop_ocr();
             }
         }
         if old.show_in_status_bar != new.show_in_status_bar {

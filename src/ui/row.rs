@@ -210,11 +210,16 @@ impl RowWidget {
             }
             let markup = obj.imp().markup.borrow();
             imp.title.set_visible(!markup.is_empty());
+            imp.title.add_css_class("dim-label");
+            // Snippets start near the match: cut at the end, not the middle.
+            imp.title.set_ellipsize(pango::EllipsizeMode::End);
             imp.title.set_markup(&markup);
         } else {
             imp.thumb.set_paintable(gdk::Paintable::NONE);
             imp.thumb.set_visible(false);
             imp.title.set_visible(true);
+            imp.title.remove_css_class("dim-label");
+            imp.title.set_ellipsize(pango::EllipsizeMode::Middle);
             imp.title.set_markup(&obj.imp().markup.borrow());
         }
         imp.shortcut.set_label(&obj.imp().shortcut.borrow());

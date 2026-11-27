@@ -89,6 +89,8 @@ pub struct Item {
     pub last_copied_at: i64,
     pub number_of_copies: i64,
     pub pin: Option<String>,
+    /// Text recognized in an image item (None = not processed yet).
+    pub ocr_text: Option<String>,
 }
 
 pub fn now_ms() -> i64 {
@@ -110,6 +112,7 @@ impl Item {
             last_copied_at: now,
             number_of_copies: 1,
             pin: None,
+            ocr_text: None,
         }
     }
 
@@ -136,6 +139,20 @@ impl Item {
 
     pub fn has_image(&self) -> bool {
         self.image_content().is_some()
+    }
+
+    /// An item shown as a picture (no text or files alongside it).
+    pub fn is_image_item(&self) -> bool {
+        self.has_image() && self.title.is_empty()
+    }
+
+    /// What search looks at: the title, or for pictures the text found in them.
+    pub fn search_text(&self) -> String {
+        if self.is_image_item() {
+            self.ocr_text.as_deref().map(one_line).unwrap_or_default()
+        } else {
+            self.title.clone()
+        }
     }
 
     #[cfg(test)]
@@ -246,6 +263,11 @@ impl Item {
             one_line.to_owned()
         }
     }
+}
+
+/// Collapses whitespace (including new lines) into single spaces.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn special_symbols(text: &str) -> String {

@@ -56,6 +56,8 @@ struct Preview {
     picture: gtk::Picture,
     meta: gtk::Label,
     pin: gtk::Button,
+    /// Text recognized in an image.
+    ocr: gtk::Label,
 }
 
 pub struct MainWindow {
@@ -473,16 +475,24 @@ impl MainWindow {
             let (pinned, unpinned) = history.ordered(&s);
             let collect = |ids: &[i64]| -> Vec<Row> {
                 let items: Vec<&Item> = ids.iter().filter_map(|id| history.get(*id)).collect();
-                let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+                let texts: Vec<String> = items.iter().map(|i| i.search_text()).collect();
+                let titles: Vec<&str> = texts.iter().map(String::as_str).collect();
                 search::search(&query, s.search_mode, &titles)
                     .into_iter()
                     .map(|m| {
                         let item = items[m.index];
+                        let is_image = item.is_image_item();
+                        // Pictures show a snippet of the text found in them, around the match.
+                        let (title, ranges) = if is_image {
+                            snippet(&texts[m.index], &m.ranges, 70)
+                        } else {
+                            (item.title.clone(), m.ranges)
+                        };
                         Row {
                             id: item.id,
-                            title: item.title.clone(),
-                            ranges: m.ranges,
-                            is_image: item.has_image() && item.title.is_empty(),
+                            title,
+                            ranges,
+                            is_image,
                             color: if s.show_hex_color_swatch { crate::model::parse_hex_color(&item.title) } else { None },
                             pin: item.pin.clone(),
                         }
@@ -870,6 +880,19 @@ impl MainWindow {
                         p.picture.set_paintable(Some(&texture));
                         p.stack.set_visible_child_name("image");
                         showed_image = true;
+                        match &item.ocr_text {
+                            Some(t) if !t.is_empty() => {
+                                p.ocr.set_text(t);
+                                p.ocr.set_visible(true);
+                                meta.push("Copy Plain copies the text in the image".to_owned());
+                            }
+                            Some(_) => p.ocr.set_visible(false),
+                            None => {
+                                let pending = app.ocr_langs.borrow().is_some();
+                                p.ocr.set_text(if pending { "Reading text…" } else { "" });
+                                p.ocr.set_visible(pending);
+                            }
+                        }
                     }
                 }
             }
@@ -924,7 +947,23 @@ fn build_preview() -> Preview {
     none.add_css_class("dim-label");
     let stack = gtk::Stack::new();
     stack.add_named(&text_scroll, Some("text"));
-    stack.add_named(&picture, Some("image"));
+    let ocr = gtk::Label::new(None);
+    ocr.set_wrap(true);
+    ocr.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    ocr.set_xalign(0.0);
+    ocr.set_selectable(true);
+    ocr.set_max_width_chars(40);
+    ocr.add_css_class("clipnest-ocr");
+    let ocr_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(160)
+        .child(&ocr)
+        .build();
+    let image_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    image_page.append(&picture);
+    image_page.append(&ocr_scroll);
+    stack.add_named(&image_page, Some("image"));
     stack.add_named(&none, Some("none"));
     stack.set_vexpand(true);
 
@@ -956,7 +995,7 @@ fn build_preview() -> Preview {
     root.append(&stack);
     root.append(&meta);
     root.append(&buttons);
-    Preview { root, stack, text, picture, meta, pin }
+    Preview { root, stack, text, picture, meta, pin, ocr }
 }
 
 fn format_time(ms: i64) -> String {
@@ -964,6 +1003,31 @@ fn format_time(ms: i64) -> String {
         .and_then(|d| d.format("%x %X"))
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+/// A window of `text` around the first match (with ranges shifted to it).
+fn snippet(text: &str, ranges: &[(usize, usize)], max_chars: usize) -> (String, Vec<(usize, usize)>) {
+    let start = ranges.first().map(|r| r.0).unwrap_or(0);
+    // Start a little before the match, on a char boundary.
+    let mut from = text[..start].char_indices().rev().nth(15).map(|(i, _)| i).unwrap_or(0);
+    if from > 0 && !ranges.is_empty() {
+        from = text[from..].find(' ').map(|p| from + p + 1).filter(|p| *p <= start).unwrap_or(from);
+    }
+    let to = text[from..].char_indices().nth(max_chars).map(|(i, _)| from + i).unwrap_or(text.len());
+    let mut out = String::new();
+    let prefix = if from > 0 { "…" } else { "" };
+    out.push_str(prefix);
+    out.push_str(&text[from..to]);
+    if to < text.len() {
+        out.push('…');
+    }
+    let shift = prefix.len() as isize - from as isize;
+    let shifted = ranges
+        .iter()
+        .filter(|(s, e)| *s >= from && *e <= to)
+        .map(|(s, e)| ((*s as isize + shift) as usize, (*e as isize + shift) as usize))
+        .collect();
+    (out, shifted)
 }
 
 /// Escapes the title for Pango and highlights the matched byte ranges.
