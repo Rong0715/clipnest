@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Clipnest
+GenericName=Clipboard Manager
+Comment=Keep and search everything you copy
+Exec=clipnest
+Icon=io.github.Rong0715.Clipnest
+Terminal=false
+Categories=Utility;GTK;
+Keywords=clipboard;history;paste;copy;
+StartupNotify=true
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true
+Actions=Preferences;
+
+[Desktop Action Preferences]
+Name=Preferences
+Exec=clipnest preferences
