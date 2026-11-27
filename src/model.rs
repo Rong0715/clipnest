@@ -106,6 +106,8 @@ pub struct Item {
     pub secret: Option<Secret>,
     /// Number of hidden-character runs in the text (see `inspect::find_hidden`).
     pub hidden: usize,
+    /// Why the text looks like a dangerous command (see `inspect::dangerous_command`).
+    pub danger: Option<&'static str>,
 }
 
 /// Identifies what a copy put on the clipboard: its text, else its image, else
@@ -140,6 +142,7 @@ impl Item {
             ocr_text: None,
             secret: None,
             hidden: 0,
+            danger: None,
         }
     }
 

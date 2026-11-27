@@ -35,7 +35,9 @@ pub struct History {
 /// Looks for secrets and hidden characters in an item. `fresh` copies with a
 /// secret are kept in memory only, until `settings.secret_lifetime` is over.
 fn inspect_item(item: &mut Item, settings: &Settings, fresh: bool) {
-    item.hidden = item.text().map(|t| inspect::find_hidden(&t).len()).unwrap_or(0);
+    let text = item.text();
+    item.hidden = text.as_deref().map(|t| inspect::find_hidden(t).len()).unwrap_or(0);
+    item.danger = text.as_deref().and_then(inspect::dangerous_command);
     let label = if !settings.protect_secrets {
         None
     } else if item.is_image_item() {

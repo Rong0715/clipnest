@@ -55,10 +55,15 @@ pub struct WatchConfig {
     pub enabled: bool,
 }
 
+pub type Contents = Vec<(String, Arc<Vec<u8>>)>;
+
 pub enum Command {
-    SetClipboard(Vec<(String, Arc<Vec<u8>>)>),
+    SetClipboard(Contents),
     Clear,
     Config(WatchConfig),
+    /// Paste in order: offer the first item; each time it has been pasted, the next.
+    Sequence(Vec<Contents>),
+    StopSequence,
 }
 
 pub enum Event {
@@ -68,6 +73,10 @@ pub enum Event {
     },
     /// A copy that was not read (paused, or an ignored type).
     Ignored,
+    /// Paste in order: item `next` (0-based) of `total` is on the clipboard now.
+    SequenceNext { next: usize, total: usize },
+    /// Paste in order ended after `pasted` of `total` items were pasted.
+    SequenceDone { pasted: usize, total: usize },
     Failed(String),
 }
 
@@ -135,6 +144,19 @@ struct Owned {
 }
 
 const READ_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Requests closer together than this belong to one paste (apps often ask for
+/// several formats, e.g. text and HTML, when pasting once).
+const PASTE_QUIET: Duration = Duration::from_millis(300);
+
+/// Requests this soon after we took the clipboard come from the compositor itself.
+const COMPOSITOR_READ: Duration = Duration::from_millis(150);
+
+struct Sequence {
+    items: Vec<Contents>,
+    index: usize,
+    /// When the current item was last handed to a pasting app.
+    pasted_at: Option<Instant>,
+}
 const MAX_ITEM_BYTES: usize = 64 * 1024 * 1024;
 
 struct Engine {
@@ -151,6 +173,9 @@ struct Engine {
     outgoing: HashMap<(Window, Atom), Outgoing>,
     chunk_size: usize,
     wayland_session: bool,
+    sequence: Option<Sequence>,
+    /// When we last took the clipboard.
+    owned_at: Option<Instant>,
 }
 
 impl Engine {
@@ -204,6 +229,8 @@ impl Engine {
             outgoing: HashMap::new(),
             chunk_size,
             wayland_session,
+            sequence: None,
+            owned_at: None,
         })
     }
 
@@ -266,10 +293,8 @@ impl Engine {
     fn next_deadline(&self) -> Option<Instant> {
         let read = self.read.as_ref().map(|r| r.deadline);
         let out = self.outgoing.values().map(|o| o.deadline).min();
-        match (read, out) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let paste = self.sequence.as_ref().and_then(|s| s.pasted_at).map(|t| t + PASTE_QUIET);
+        [read, out, paste].into_iter().flatten().min()
     }
 
     fn check_timeouts(&mut self) -> Result<(), BoxError> {
@@ -283,7 +308,35 @@ impl Engine {
             self.request_next()?;
         }
         self.outgoing.retain(|_, o| o.deadline > now);
+        let pasted = self.sequence.as_ref().and_then(|s| s.pasted_at).is_some_and(|t| t + PASTE_QUIET <= now);
+        if pasted {
+            self.advance_sequence()?;
+        }
         Ok(())
+    }
+
+    /// The current item was pasted: offer the next one, or finish.
+    fn advance_sequence(&mut self) -> Result<(), BoxError> {
+        let Some(seq) = self.sequence.as_mut() else { return Ok(()) };
+        seq.pasted_at = None;
+        seq.index += 1;
+        let total = seq.items.len();
+        if seq.index >= total {
+            self.sequence = None; // the last item stays on the clipboard
+            let _ = self.events.send_blocking(Event::SequenceDone { pasted: total, total });
+            return Ok(());
+        }
+        let (next, contents) = (seq.index, seq.items[seq.index].clone());
+        self.take_ownership(contents)?;
+        let _ = self.events.send_blocking(Event::SequenceNext { next, total });
+        Ok(())
+    }
+
+    fn end_sequence(&mut self) {
+        if let Some(seq) = self.sequence.take() {
+            let total = seq.items.len();
+            let _ = self.events.send_blocking(Event::SequenceDone { pasted: seq.index, total });
+        }
     }
 
     fn atom(&mut self, name: &str) -> Result<Atom, BoxError> {
@@ -331,6 +384,7 @@ impl Engine {
             XEvent::SelectionRequest(ev) => self.on_selection_request(ev)?,
             XEvent::SelectionClear(ev) if ev.selection == self.atoms.CLIPBOARD => {
                 self.owned = None;
+                self.end_sequence(); // someone else copied
             }
             _ => {}
         }
@@ -527,11 +581,27 @@ impl Engine {
     fn handle_command(&mut self, cmd: Command) -> Result<(), BoxError> {
         match cmd {
             Command::Config(config) => self.config = config,
-            Command::SetClipboard(contents) => self.take_ownership(contents)?,
+            Command::SetClipboard(contents) => {
+                self.end_sequence();
+                self.take_ownership(contents)?
+            }
+            Command::Sequence(items) => {
+                self.end_sequence();
+                if let Some(first) = items.first().cloned() {
+                    let total = items.len();
+                    self.take_ownership(first)?;
+                    self.sequence = Some(Sequence { items, index: 0, pasted_at: None });
+                    let _ = self.events.send_blocking(Event::SequenceNext { next: 0, total });
+                }
+            }
+            Command::StopSequence => self.end_sequence(),
             // Owning the clipboard with empty text replaces its contents everywhere.
             // Setting no owner is not passed on to Wayland apps by GNOME, so the old
             // contents would stay pasteable there.
-            Command::Clear => self.take_ownership(vec![(MIME_TEXT.to_owned(), Arc::new(Vec::new()))])?,
+            Command::Clear => {
+                self.end_sequence();
+                self.take_ownership(vec![(MIME_TEXT.to_owned(), Arc::new(Vec::new()))])?
+            }
         }
         Ok(())
     }
@@ -588,6 +658,7 @@ impl Engine {
             }
         }
         self.owned = Some(Owned { entries, timestamp: CURRENT_TIME });
+        self.owned_at = Some(Instant::now());
         self.conn.set_selection_owner(self.win, self.atoms.CLIPBOARD, CURRENT_TIME)?;
         let owner = self.conn.get_selection_owner(self.atoms.CLIPBOARD)?.reply()?.owner;
         if owner != self.win {
@@ -640,6 +711,23 @@ impl Engine {
                     }
                     reply_property = property;
                 }
+            }
+        }
+        // Paste in order: a real paste (not just a look at the formats) was served.
+        let format_query = [self.atoms.TARGETS, self.atoms.TIMESTAMP, self.atoms.MULTIPLE, self.atoms.SAVE_TARGETS]
+            .contains(&ev.target);
+        crate::debug!(
+            "selection request: {} from window {:#x}{}",
+            self.atom_names.get(&ev.target).cloned().unwrap_or_default(),
+            ev.requestor,
+            self.owned_at.map(|t| format!(", {} ms after taking the clipboard", t.elapsed().as_millis())).unwrap_or_default()
+        );
+        // GNOME reads new clipboard contents right away (within a few ms) to keep
+        // them when the owner quits; that is not a paste.
+        let compositor_copy = self.owned_at.is_some_and(|t| t.elapsed() < COMPOSITOR_READ);
+        if reply_property != NONE && !format_query && !compositor_copy {
+            if let Some(seq) = self.sequence.as_mut() {
+                seq.pasted_at = Some(Instant::now());
             }
         }
         let notify = SelectionNotifyEvent {

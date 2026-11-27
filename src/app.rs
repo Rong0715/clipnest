@@ -38,6 +38,8 @@ pub struct App {
     /// What the clipboard holds as far as we know (`Item::fingerprint`), so a
     /// sensitive copy is only cleared while it is still there.
     clipboard_now: Cell<Option<u64>>,
+    /// Paste in order: the items (oldest first) and which one is on the clipboard.
+    sequence: RefCell<Option<(Vec<i64>, usize)>>,
     ocr: RefCell<Option<Ocr>>,
     /// Tesseract languages in use, when text recognition is running.
     pub ocr_langs: RefCell<Option<String>>,
@@ -75,6 +77,7 @@ pub fn run() -> glib::ExitCode {
         regexes: RefCell::new(Vec::new()),
         last_copied: Cell::new(None),
         clipboard_now: Cell::new(None),
+        sequence: RefCell::new(None),
         ocr: RefCell::new(None),
         ocr_langs: RefCell::new(None),
         tray_thumbs: RefCell::new(std::collections::HashMap::new()),
@@ -170,6 +173,7 @@ impl App {
             ("win.focus-search", &["<Control>f"]),
             ("win.toggle-preview", &["<Control>space"]),
             ("win.pin", &["<Alt>p"]),
+            ("win.sequence", &["<Alt>o"]),
             ("win.delete", &["<Alt>BackSpace"]),
             ("win.clear", &["<Control><Shift>BackSpace"]),
             ("win.show-help", &["<Control>question", "F1"]),
@@ -222,9 +226,10 @@ impl App {
                         if item.hidden > 0 {
                             summary = inspect::reveal(&summary);
                         }
-                        let note = match item.expires_at() {
-                            Some(at) => format!("   (sensitive, removed in {} s)", seconds_left(at)),
-                            None => String::new(),
+                        let note = match (item.expires_at(), item.danger) {
+                            (Some(at), _) => format!("   (sensitive, removed in {} s)", seconds_left(at)),
+                            (None, Some(why)) => format!("   (dangerous: {why})"),
+                            (None, None) => String::new(),
                         };
                         print(format!("{:>3}  {pin}{summary}{note}", i + 1));
                     }
@@ -244,6 +249,17 @@ impl App {
                 Some(id) => self.copy_item(id, args.iter().any(|a| a == "--plain")),
                 None => {
                     cmd.printerr_literal("usage: clipnest copy N [--plain]\n");
+                    return glib::ExitCode::FAILURE;
+                }
+            },
+            Some("sequence") if args.get(1).map(String::as_str) == Some("stop") => self.stop_sequence(),
+            Some("sequence") => match nth(args.get(1)) {
+                Some(id) => {
+                    let ids = self.sequence_from(id);
+                    self.start_sequence(ids);
+                }
+                None => {
+                    cmd.printerr_literal("usage: clipnest sequence N | stop\n");
                     return glib::ExitCode::FAILURE;
                 }
             },
@@ -351,6 +367,8 @@ impl App {
                 self.clipboard_now.set(None);
                 self.consume_ignore_next();
             }
+            Event::SequenceNext { next, total } => self.on_sequence_next(next, total),
+            Event::SequenceDone { pasted, total } => self.on_sequence_done(pasted, total),
             Event::Copied { contents, application } => {
                 self.clipboard_now.set(model::fingerprint_of(&contents));
                 self.on_copied(contents, application);
@@ -435,13 +453,13 @@ impl App {
     /// sensitive items, or the usual "Copied".
     fn announce_copy(self: &Rc<Self>, id: i64) {
         let s = self.settings.borrow().clone();
-        let (hidden, sensitive) = {
+        let (hidden, danger, sensitive) = {
             let history = self.history.borrow();
             let Some(item) = history.get(id) else { return };
-            (item.hidden > 0, item.is_ephemeral())
+            (item.hidden > 0, item.danger.is_some(), item.is_ephemeral())
         };
-        if hidden && s.warn_hidden_characters {
-            self.warn_hidden(id);
+        if (hidden && s.warn_hidden_characters) || (danger && s.warn_dangerous_commands) {
+            self.warn_suspicious(id);
         } else if s.notify_on_copy {
             if sensitive {
                 self.notify_secret(id);
@@ -476,28 +494,68 @@ impl App {
         self.notifier.notify(&summary, &body);
     }
 
-    /// A warning that stays until dismissed, with actions to copy the text without
-    /// the hidden characters or to look at it.
-    fn warn_hidden(self: &Rc<Self>, id: i64) {
-        let body = {
+    /// What "copy cleaned" puts on the clipboard for an item, and the button label
+    /// for it; `None` when there is nothing to clean.
+    fn cleaned_text(&self, id: i64) -> Option<(String, &'static str)> {
+        let s = self.settings.borrow().clone();
+        let history = self.history.borrow();
+        let item = history.get(id)?;
+        let text = item.text()?;
+        let hidden = item.hidden > 0 && s.warn_hidden_characters;
+        let danger = item.danger.is_some() && s.warn_dangerous_commands;
+        let without_hidden = if hidden { inspect::clean(&text) } else { text.clone() };
+        let cleaned = if danger { without_hidden.trim_end_matches(['\n', '\r']).to_owned() } else { without_hidden.clone() };
+        let label = match (without_hidden != text, cleaned != without_hidden) {
+            (false, false) => return None,
+            (true, false) => "Copy Without Them",
+            (false, true) => "Copy Without Line Break",
+            (true, true) => "Copy Cleaned",
+        };
+        Some((cleaned, label))
+    }
+
+    /// A warning that stays until dismissed (hidden characters, dangerous command),
+    /// with actions to copy a cleaned version or to look at it. With "clean
+    /// suspicious copies" on, the clipboard is cleaned right away instead.
+    fn warn_suspicious(self: &Rc<Self>, id: i64) {
+        let s = self.settings.borrow().clone();
+        let cleaned = self.cleaned_text(id);
+        let auto = s.clean_suspicious_copies && cleaned.is_some();
+        let (summary, body) = {
             let history = self.history.borrow();
             let Some(item) = history.get(id) else { return };
-            let found = inspect::find_hidden(&item.text().unwrap_or_default());
-            let mut what = inspect::describe(&found);
-            if let Some(first) = what.get_mut(..1) {
-                first.make_ascii_uppercase();
+            let mut lines = vec![inspect::reveal(&item.summary(120))];
+            let danger = item.danger.filter(|_| s.warn_dangerous_commands);
+            if let Some(why) = danger {
+                lines.push(format!("{why}."));
             }
-            format!("{}\n{what}", inspect::reveal(&item.summary(120)))
+            if item.hidden > 0 && s.warn_hidden_characters {
+                let mut what = inspect::describe(&inspect::find_hidden(&item.text().unwrap_or_default()));
+                if let Some(first) = what.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                lines.push(format!("Hidden: {what}."));
+            }
+            if auto {
+                lines.push("Cleaned on the clipboard.".to_owned());
+            }
+            let summary = if danger.is_some() { "Dangerous command copied" } else { "Hidden characters in copied text" };
+            (summary, lines.join("\n"))
         };
+        if auto {
+            if let Some((text, _)) = &cleaned {
+                self.copy_text(text);
+            }
+        }
+        let clean_label = cleaned.as_ref().filter(|_| !auto).map(|(_, label)| *label);
+        let mut actions: Vec<(&str, &str)> = Vec::new();
+        if let Some(label) = clean_label {
+            actions.push(("clean", label));
+        }
+        actions.push(("default", "Show"));
         let weak = Rc::downgrade(self);
         self.notifier.show(
-            Notice {
-                summary: "Hidden characters in copied text",
-                body: &body,
-                urgency: Urgency::Critical,
-                transient: false,
-                actions: &[("clean", "Copy Without Them"), ("default", "Show")],
-            },
+            Notice { summary, body: &body, urgency: Urgency::Critical, transient: false, actions: &actions },
             Some(Rc::new(move |action: &str, token: Option<String>| {
                 let Some(app) = weak.upgrade() else { return };
                 match action {
@@ -514,6 +572,96 @@ impl App {
             w.present(token);
             w.select_item(id);
         }
+    }
+
+    // ---- paste in order -----------------------------------------------------------
+
+    /// Item `id` and everything copied after it, oldest first (for "paste in order").
+    pub fn sequence_from(&self, id: i64) -> Vec<i64> {
+        let history = self.history.borrow();
+        let Some(start) = history.get(id) else { return Vec::new() };
+        if start.is_pinned() {
+            return vec![id];
+        }
+        let mut items: Vec<&model::Item> = history
+            .items()
+            .iter()
+            .filter(|i| !i.is_pinned() && i.last_copied_at >= start.last_copied_at)
+            .collect();
+        items.sort_by_key(|i| i.last_copied_at);
+        items.iter().map(|i| i.id).collect()
+    }
+
+    /// Puts the first item on the clipboard; each paste (Ctrl+V in any app) moves
+    /// on to the next one.
+    pub fn start_sequence(self: &Rc<Self>, ids: Vec<i64>) {
+        let items: Vec<(i64, x11::Contents)> = {
+            let history = self.history.borrow();
+            ids.iter()
+                .map(|id| {
+                    let contents = history.clipboard_contents(*id, false);
+                    (*id, contents.into_iter().map(|(m, d)| (m, Arc::new(d.to_vec()))).collect::<x11::Contents>())
+                })
+                .filter(|(_, c)| !c.is_empty())
+                .collect()
+        };
+        if items.is_empty() {
+            return;
+        }
+        *self.sequence.borrow_mut() = Some((items.iter().map(|(id, _)| *id).collect(), 0));
+        self.send(Command::Sequence(items.into_iter().map(|(_, c)| c).collect()));
+    }
+
+    pub fn stop_sequence(&self) {
+        self.send(Command::StopSequence);
+    }
+
+    /// (position of the item on the clipboard, 1-based; number of items).
+    pub fn sequence_status(&self) -> Option<(usize, usize)> {
+        self.sequence.borrow().as_ref().map(|(ids, next)| (next + 1, ids.len()))
+    }
+
+    fn on_sequence_next(self: &Rc<Self>, next: usize, total: usize) {
+        let id = {
+            let mut seq = self.sequence.borrow_mut();
+            let Some((ids, pos)) = seq.as_mut() else { return };
+            *pos = next;
+            ids.get(next).copied()
+        };
+        let summary = id.and_then(|id| self.history.borrow().get(id).map(|i| (i.fingerprint(), i.summary(100))));
+        if let Some((fingerprint, text)) = summary {
+            self.clipboard_now.set(fingerprint);
+            let title = if next == 0 {
+                format!("Paste in order: {total} items")
+            } else {
+                format!("Next: {} of {total}", next + 1)
+            };
+            let body = if next == 0 { format!("Paste as usual (Ctrl+V); each paste moves to the next item.\n1: {text}") } else { text };
+            self.notifier.notify(&title, &body);
+        }
+        if let Some(id) = id {
+            self.renew_secret(id);
+        }
+        self.sequence_changed();
+    }
+
+    fn on_sequence_done(self: &Rc<Self>, pasted: usize, total: usize) {
+        if self.sequence.borrow_mut().take().is_none() {
+            return;
+        }
+        if pasted >= total {
+            self.notifier.notify("Pasted all items in order", &format!("{total} items. The last one stays on the clipboard."));
+        } else {
+            self.notifier.notify("Stopped pasting in order", &format!("{pasted} of {total} items were pasted."));
+        }
+        self.sequence_changed();
+    }
+
+    fn sequence_changed(self: &Rc<Self>) {
+        if let Some(w) = self.window() {
+            w.update_banner();
+        }
+        self.update_tray_menu();
     }
 
     // ---- sensitive items --------------------------------------------------------
@@ -570,13 +718,17 @@ impl App {
 
     /// Copies an item's text without its hidden characters (and records that copy).
     pub fn copy_cleaned(self: &Rc<Self>, id: i64) {
-        let Some(text) = self.history.borrow().get(id).and_then(|i| i.text()) else { return };
-        let cleaned = inspect::clean(&text);
+        let Some((cleaned, _)) = self.cleaned_text(id) else { return };
         self.copy_text(&cleaned);
         if self.settings.borrow().notify_on_copy {
             let preview = self.history.borrow().get(self.last_copied.get().unwrap_or(0)).map(|i| i.summary(140));
-            self.notifier.notify("Copied without hidden characters", &preview.unwrap_or_default());
+            self.notifier.notify("Copied cleaned text", &preview.unwrap_or_default());
         }
+    }
+
+    /// Button label for `copy_cleaned`, if the item has anything to clean.
+    pub fn clean_label(&self, id: i64) -> Option<&'static str> {
+        self.cleaned_text(id).map(|(_, label)| label)
     }
 
     fn notify_item(&self, summary: &str, id: i64) {
@@ -990,7 +1142,11 @@ impl App {
         let tray = self.tray.borrow();
         let Some(tray) = tray.as_ref() else { return };
         let s = self.settings.borrow().clone();
-        let mut entries = vec![MenuEntry::item("Open Clipnest", || app().show_window(None)), MenuEntry::Separator];
+        let mut entries = vec![MenuEntry::item("Open Clipnest", || app().show_window(None))];
+        if let Some((next, total)) = self.sequence_status() {
+            entries.push(MenuEntry::item(format!("Stop Pasting in Order ({next} of {total})"), || app().stop_sequence()));
+        }
+        entries.push(MenuEntry::Separator);
         {
             let history = self.history.borrow();
             let (pinned, unpinned) = history.ordered(&s);
@@ -1016,7 +1172,9 @@ impl App {
                     let text = match &thumb {
                         Some((_, w, h)) => format!("Image ({w}×{h})"),
                         None if item.is_image_item() && item.secret.is_some() => "Sensitive image".to_owned(),
-                        None if item.hidden > 0 && s.warn_hidden_characters => {
+                        None if (item.hidden > 0 && s.warn_hidden_characters)
+                            || (item.danger.is_some() && s.warn_dangerous_commands) =>
+                        {
                             format!("⚠ {}", inspect::reveal(&item.summary(48)))
                         }
                         None => item.summary(48),

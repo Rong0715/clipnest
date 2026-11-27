@@ -318,21 +318,34 @@ fn privacy_page() -> adw::PreferencesPage {
     }
     p.add(&secrets);
 
-    let hidden = adw::PreferencesGroup::builder()
-        .title("Hidden characters")
+    let suspicious = adw::PreferencesGroup::builder()
+        .title("Suspicious copies")
         .description(
             "Text copied from web pages can contain characters you can't see: zero-width \
              spaces, text-direction controls, invisible tag text or terminal escape codes. \
-             They can make a command do something other than what it shows.",
+             They can make a command do something other than what it shows. Pasting a \
+             command that ends with a line break into a terminal can run it at once.",
         )
         .build();
-    hidden.add(&switch(
+    suspicious.add(&switch(
         "Warn about hidden characters",
         Some("Mark them in the history and notify, with a button to copy the text without them"),
         |s| s.warn_hidden_characters,
         |s, v| s.warn_hidden_characters = v,
     ));
-    p.add(&hidden);
+    suspicious.add(&switch(
+        "Warn about dangerous commands",
+        Some("A few commands that wipe or damage the system, and code run in disguise. Usual “curl … | sh” installers are not flagged."),
+        |s| s.warn_dangerous_commands,
+        |s, v| s.warn_dangerous_commands = v,
+    ));
+    suspicious.add(&switch(
+        "Clean suspicious copies right away",
+        Some("Replace them on the clipboard: hidden characters removed, and no line break at the end of a dangerous command"),
+        |s| s.clean_suspicious_copies,
+        |s, v| s.clean_suspicious_copies = v,
+    ));
+    p.add(&suspicious);
     p
 }
 

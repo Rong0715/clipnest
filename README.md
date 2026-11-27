@@ -34,6 +34,17 @@ something is copied, and gives you a window to search, copy back, pin and delete
 - **Hidden-character warnings** — zero-width characters, text-direction controls, invisible
   tag text and terminal escape codes in copied text (a common trick in commands on web
   pages) are shown as red labels, with a notification offering to copy the text without them.
+- **Dangerous-command warnings** — a short list of commands that wipe or damage the system
+  (`rm -rf ~`, `mkfs`, `dd of=/dev/sda`, a fork bomb…) or run code in disguise (base64 piped
+  to a shell, scripts from bare IP addresses or plain HTTP). Ordinary `curl … | sh`
+  installers are not flagged. Optionally, suspicious copies are cleaned on the clipboard
+  right away, including the line break at the end that would run a command when pasted.
+- **Paste in order** — pick an item (Alt+O or right-click → *Paste in Order From Here*) and
+  it plus everything copied after it are pasted one by one, oldest first: each normal paste
+  (Ctrl+V, in any app) moves on to the next item. Handy for filling in forms.
+- **Quick conversions** in the details pane — Unix timestamps shown as dates, JSON formatted
+  or minified, URL-encoded and Base64 text decoded, JSON Web Tokens decoded, and colors
+  (`#ff5733`, `rgb()`, `hsl()`) shown as swatches and copied as HEX, RGB or HSL.
 - Ignore lists: password-manager hints (KeePassXC etc.), custom clipboard types, regular
   expressions, and X11 applications.
 - Pause, "ignore next copy", history size limit, sort order.
@@ -86,6 +97,7 @@ Turn on *Launch at login* in Preferences → General to start it automatically.
 | Ctrl+&lt;key&gt; | Copy a pinned item |
 | Alt+P | Pin / unpin |
 | Alt+Backspace, Delete (empty search) | Delete |
+| Alt+O | Paste this item and the newer ones in order |
 | Ctrl+Space | Show / hide details |
 | Ctrl+F, Ctrl+U | Search, clear search |
 | Ctrl+Shift+Backspace | Clear history |
@@ -95,7 +107,8 @@ Turn on *Launch at login* in Preferences → General to start it automatically.
 ## Command line
 
 `clipnest --help` lists commands such as `clipnest list`, `clipnest copy 3`,
-`clipnest pause` and `clipnest toggle` (handy for a custom keyboard shortcut).
+`clipnest pause`, `clipnest sequence 3` (paste the last three copies in order) and
+`clipnest toggle` (handy for a custom keyboard shortcut).
 
 ## How it works on Wayland
 

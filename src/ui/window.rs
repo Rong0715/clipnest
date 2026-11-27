@@ -70,6 +70,11 @@ struct Preview {
     /// "Hidden: 2 zero-width characters" with a button to copy the text without them.
     hidden_bar: gtk::Box,
     hidden_label: gtk::Label,
+    clean: gtk::Button,
+    /// "As a Unix time: …" for copied timestamps.
+    time_note: gtk::Label,
+    /// Buttons such as "Format JSON" or "Decode Base64" (each copies the result).
+    conversions: gtk::Box,
     /// Highlights ⟨ZWSP⟩-style markers in the text.
     marker_tag: gtk::TextTag,
 }
@@ -281,6 +286,7 @@ impl MainWindow {
         add("copy", Box::new(|w| w.copy_selected(false)));
         add("copy-plain", Box::new(|w| w.copy_selected(true)));
         add("copy-clean", Box::new(|w| w.copy_clean_selected()));
+        add("sequence", Box::new(|w| w.sequence_from_selected()));
         add("pin", Box::new(|w| w.toggle_pin_selected()));
         add("delete", Box::new(|w| w.delete_selected()));
         add("pin-up", Box::new(|w| w.move_pin_selected(-1)));
@@ -349,7 +355,11 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.banner.connect_button_clicked(move |_| {
             if weak.upgrade().is_some() {
-                app().set_paused(false);
+                if app().sequence_status().is_some() {
+                    app().stop_sequence();
+                } else {
+                    app().set_paused(false);
+                }
             }
         });
 
@@ -486,7 +496,11 @@ impl MainWindow {
     /// Updates the "paused" banner.
     pub fn update_banner(&self) {
         let s = settings();
-        if s.ignore_events && s.ignore_only_next_event {
+        if let Some((next, total)) = app().sequence_status() {
+            self.banner.set_title(&format!("Pasting in order — item {next} of {total} is on the clipboard"));
+            self.banner.set_button_label(Some("Stop"));
+            self.banner.set_revealed(true);
+        } else if s.ignore_events && s.ignore_only_next_event {
             self.banner.set_title("The next copy will not be saved");
             self.banner.set_button_label(Some("Save It"));
             self.banner.set_revealed(true);
@@ -543,7 +557,7 @@ impl MainWindow {
                         let warn = item.hidden > 0 && s.warn_hidden_characters;
                         let status = if item.secret.is_some() {
                             RowStatus::Sensitive
-                        } else if warn {
+                        } else if warn || (item.danger.is_some() && s.warn_dangerous_commands) {
                             RowStatus::Hidden
                         } else {
                             RowStatus::None
@@ -554,7 +568,7 @@ impl MainWindow {
                             title,
                             ranges,
                             is_image,
-                            color: if s.show_hex_color_swatch { crate::model::parse_hex_color(&item.title) } else { None },
+                            color: if s.show_hex_color_swatch { crate::convert::parse_color(&item.title) } else { None },
                             pin: item.pin.clone(),
                             status,
                             hidden,
@@ -878,6 +892,19 @@ impl MainWindow {
         }
     }
 
+    /// Paste in order: this item, then everything copied after it.
+    fn sequence_from_selected(self: &Rc<Self>) {
+        let Some(Slot::Item(id)) = self.selected_slot() else { return };
+        let ids = app().sequence_from(id);
+        let count = ids.len();
+        app().start_sequence(ids);
+        if settings().close_after_copy {
+            self.window.close();
+        } else {
+            self.toast(&format!("Paste {count} items in order with Ctrl+V"));
+        }
+    }
+
     fn toggle_pin_selected(self: &Rc<Self>) {
         let Some(id) = self.selected_id() else { return };
         if !app().history.borrow().can_pin(id) {
@@ -897,13 +924,15 @@ impl MainWindow {
 
     fn show_context_menu(self: &Rc<Self>, row: &RowWidget, x: f64, y: f64) {
         let pinned = self.selected_slot().map(|s| matches!(s, Slot::Pin(_))).unwrap_or(false);
-        let hidden = settings().warn_hidden_characters
-            && self.selected_id().is_some_and(|id| app().history.borrow().get(id).is_some_and(|i| i.hidden > 0));
+        let clean_label = self.selected_id().and_then(|id| app().clean_label(id));
         let menu = gio::Menu::new();
         menu.append(Some("Copy"), Some("win.copy"));
         menu.append(Some("Copy Without Formatting"), Some("win.copy-plain"));
-        if hidden {
-            menu.append(Some("Copy Without Hidden Characters"), Some("win.copy-clean"));
+        if let Some(label) = clean_label {
+            menu.append(Some(label), Some("win.copy-clean"));
+        }
+        if !pinned {
+            menu.append(Some("Paste in Order From Here"), Some("win.sequence"));
         }
         menu.append(Some(if pinned { "Unpin" } else { "Pin" }), Some("win.pin"));
         if pinned {
@@ -931,6 +960,7 @@ impl MainWindow {
              Ctrl+1 … Ctrl+9 — copy one of the first nine items\n\
              Ctrl+<key> — copy a pinned item\n\
              Alt+P — pin or unpin\n\
+             Alt+O — paste this item and the newer ones in order\n\
              Alt+Backspace, or Delete with an empty search — delete\n\
              Ctrl+Space — show or hide details\n\
              Ctrl+F — search · Ctrl+U — clear search\n\
@@ -950,6 +980,8 @@ impl MainWindow {
             p.meta.set_text("");
             p.secret_bar.set_visible(false);
             p.hidden_bar.set_visible(false);
+            p.time_note.set_visible(false);
+            p.conversions.set_visible(false);
             return;
         };
         let s = settings();
@@ -980,11 +1012,26 @@ impl MainWindow {
         } else {
             Vec::new()
         };
-        p.hidden_bar.set_visible(!hidden.is_empty());
+        // Warnings: dangerous command, hidden characters.
+        let mut warnings: Vec<String> = Vec::new();
+        if let Some(why) = item.danger.filter(|_| s.warn_dangerous_commands) {
+            warnings.push(format!("Dangerous command: {why}."));
+        }
         if !hidden.is_empty() {
-            p.hidden_label.set_text(&format!("Hidden: {}", inspect::describe(&hidden)));
+            warnings.push(format!("Hidden: {}.", inspect::describe(&hidden)));
+        }
+        p.hidden_bar.set_visible(!warnings.is_empty());
+        p.hidden_label.set_text(&warnings.join("\n"));
+        match app.clean_label(id) {
+            Some(label) => {
+                p.clean.set_label(label);
+                p.clean.set_visible(true);
+            }
+            None => p.clean.set_visible(false),
         }
 
+        p.time_note.set_visible(false);
+        p.conversions.set_visible(false);
         let mut meta: Vec<String> = Vec::new();
         let mut showed_image = false;
         if item.has_image() && item.title.is_empty() {
@@ -1037,6 +1084,9 @@ impl MainWindow {
             p.stack.set_visible_child_name("text");
             p.picture.set_paintable(gdk::Paintable::NONE);
             meta.push(format!("{} characters", full.chars().count()));
+            if !masked && item.file_uris().is_empty() {
+                self.show_conversions(&full);
+            }
         }
         if let Some(application) = &item.application {
             meta.push(format!("Application: {application}"));
@@ -1049,6 +1099,57 @@ impl MainWindow {
         }
         p.meta.set_text(&meta.join("\n"));
         p.pin.set_label(if item.pin.is_some() { "Unpin" } else { "Pin" });
+    }
+
+    /// Timestamp as a date, and buttons for JSON / URL / Base64 / JWT conversions.
+    fn show_conversions(&self, text: &str) {
+        let p = &self.preview;
+        if let Some(secs) = crate::convert::unix_time(text) {
+            let fmt = |d: Option<glib::DateTime>| {
+                d.and_then(|d| d.format("%Y-%m-%d %H:%M:%S").ok()).map(|s| s.to_string()).unwrap_or_default()
+            };
+            p.time_note.set_text(&format!(
+                "As a Unix time: {} local · {} UTC",
+                fmt(glib::DateTime::from_unix_local(secs).ok()),
+                fmt(glib::DateTime::from_unix_utc(secs).ok())
+            ));
+            p.time_note.set_visible(true);
+        }
+        while let Some(child) = p.conversions.first_child() {
+            p.conversions.remove(&child);
+        }
+        let list = crate::convert::conversions(text);
+        if let Some([r, g, b, a]) = crate::convert::parse_color(text) {
+            let swatch = gtk::DrawingArea::builder().content_width(40).content_height(28).valign(gtk::Align::Center).build();
+            swatch.set_draw_func(move |_, cr, w, h| {
+                let (w, h, radius) = (w as f64, h as f64, 6.0);
+                cr.new_sub_path();
+                cr.arc(w - radius, radius, radius, -90f64.to_radians(), 0.0);
+                cr.arc(w - radius, h - radius, radius, 0.0, 90f64.to_radians());
+                cr.arc(radius, h - radius, radius, 90f64.to_radians(), 180f64.to_radians());
+                cr.arc(radius, radius, radius, 180f64.to_radians(), 270f64.to_radians());
+                cr.close_path();
+                cr.set_source_rgba(r, g, b, a);
+                let _ = cr.fill_preserve();
+                cr.set_source_rgba(0.5, 0.5, 0.5, 0.5);
+                cr.set_line_width(1.0);
+                let _ = cr.stroke();
+            });
+            p.conversions.append(&swatch);
+        }
+        for c in &list {
+            let button = gtk::Button::with_label(c.label);
+            button.set_tooltip_text(Some("Copy the result"));
+            let result = c.result.clone();
+            button.connect_clicked(move |_| {
+                app().copy_text(&result);
+                if let Some(w) = app().window() {
+                    w.after_copy();
+                }
+            });
+            p.conversions.append(&button);
+        }
+        p.conversions.set_visible(p.conversions.first_child().is_some());
     }
 
     /// Keeps the "removed in N s" text of a sensitive item current.
@@ -1211,10 +1312,20 @@ fn build_preview() -> Preview {
     root.set_size_request(260, -1);
     root.append(&secret_bar);
     root.append(&hidden_bar);
+    let time_note = gtk::Label::new(None);
+    time_note.set_xalign(0.0);
+    time_note.set_wrap(true);
+    time_note.set_selectable(true);
+    time_note.add_css_class("clipnest-ocr");
+    time_note.set_visible(false);
+    let conversions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    conversions.set_visible(false);
     root.append(&stack);
+    root.append(&time_note);
+    root.append(&conversions);
     root.append(&meta);
     root.append(&buttons);
-    Preview { root, stack, text, picture, meta, pin, ocr, secret_bar, secret_label, reveal, hidden_bar, hidden_label, marker_tag }
+    Preview { root, stack, text, picture, meta, pin, ocr, secret_bar, secret_label, reveal, hidden_bar, hidden_label, clean, time_note, conversions, marker_tag }
 }
 
 fn format_time(ms: i64) -> String {

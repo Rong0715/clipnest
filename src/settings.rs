@@ -117,6 +117,11 @@ pub struct Settings {
     pub secret_lifetime: u32,
     /// Mark and warn about invisible characters and terminal escapes in copied text.
     pub warn_hidden_characters: bool,
+    /// Mark and warn about a few clearly dangerous commands (`rm -rf ~`, `mkfs`…).
+    pub warn_dangerous_commands: bool,
+    /// Replace suspicious copies on the clipboard right away: hidden characters
+    /// removed and, for dangerous commands, the final line break (opt-in).
+    pub clean_suspicious_copies: bool,
     // Advanced
     pub clear_on_quit: bool,
     pub clear_system_clipboard: bool,
@@ -156,6 +161,8 @@ impl Default for Settings {
             protect_secrets: true,
             secret_lifetime: 30,
             warn_hidden_characters: true,
+            warn_dangerous_commands: true,
+            clean_suspicious_copies: false,
             clear_on_quit: false,
             clear_system_clipboard: false,
             suppress_clear_alert: false,

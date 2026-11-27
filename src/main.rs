@@ -3,6 +3,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod convert;
 mod history;
 mod inspect;
 mod keys;
@@ -34,6 +35,7 @@ Commands:
   list [N]             print the N most recent items (default 20)
   get N                print item N (numbers as shown by `list`)
   copy N [--plain]     put item N back on the clipboard
+  sequence N | stop    paste items N…1 in order: each paste (Ctrl+V) moves on
   delete N             delete item N
   clear | clear-all    clear the history (clear-all also removes pinned items)
   pause | resume       stop or resume saving new copies
