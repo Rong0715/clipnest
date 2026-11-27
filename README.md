@@ -99,7 +99,17 @@ optional launch at login.
 
 ## Install
 
-Build requirements on Ubuntu/Debian:
+**From a release** (x86_64, Ubuntu 24.04 or newer): download
+`clipnest-…-x86_64-linux.tar.gz` from [Releases](https://github.com/Rong0715/clipnest/releases),
+then:
+
+```sh
+tar xzf clipnest-*-x86_64-linux.tar.gz
+cd clipnest-*-x86_64-linux
+./install.sh
+```
+
+**From source** — build requirements on Ubuntu/Debian:
 
 ```sh
 sudo apt install cargo build-essential pkg-config libgtk-4-dev libadwaita-1-dev
