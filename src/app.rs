@@ -726,6 +726,11 @@ impl App {
         }
     }
 
+    /// The item copied last from Clipnest itself.
+    pub fn last_copied_id(&self) -> Option<i64> {
+        self.last_copied.get()
+    }
+
     /// Button label for `copy_cleaned`, if the item has anything to clean.
     pub fn clean_label(&self, id: i64) -> Option<&'static str> {
         self.cleaned_text(id).map(|(_, label)| label)
@@ -1183,7 +1188,10 @@ impl App {
                         Some(p) => format!("{text}   ⟨{}⟩", p.to_uppercase()),
                         None => text,
                     };
-                    let icon = thumb.map(|(png, _, _)| png);
+                    // Copied colors get a small swatch, like in the window.
+                    let icon = thumb.map(|(png, _, _)| png).or_else(|| {
+                        crate::convert::parse_color(&item.title).filter(|_| s.show_hex_color_swatch).and_then(color_swatch_png)
+                    });
                     entries.push(MenuEntry::item(label, move || {
                         let app = app();
                         app.copy_item(id, false);
@@ -1229,6 +1237,14 @@ fn tray_thumbnail(data: &[u8]) -> Option<(Rc<Vec<u8>>, i32, i32)> {
     let png = loader.pixbuf()?.save_to_bufferv("png", &[]).ok()?;
     let (w, h) = original.get();
     Some((Rc::new(png), w, h))
+}
+
+/// A 16×16 PNG filled with a color (for the tray menu).
+fn color_swatch_png([r, g, b, a]: [f64; 4]) -> Option<Rc<Vec<u8>>> {
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 16, 16)?;
+    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    pixbuf.fill((byte(r) << 24) | (byte(g) << 16) | (byte(b) << 8) | byte(a));
+    pixbuf.save_to_bufferv("png", &[]).ok().map(Rc::new)
 }
 
 /// Re-encodes an image as PNG.

@@ -1139,12 +1139,16 @@ impl MainWindow {
         }
         for c in &list {
             let button = gtk::Button::with_label(c.label);
-            button.set_tooltip_text(Some("Copy the result"));
+            button.set_tooltip_text(Some("Copy the result and show it"));
             let result = c.result.clone();
+            let label = c.label;
             button.connect_clicked(move |_| {
-                app().copy_text(&result);
-                if let Some(w) = app().window() {
-                    w.after_copy();
+                // Stay open and show the result (it is copied and added to the history).
+                let app = app();
+                app.copy_text(&result);
+                if let (Some(w), Some(id)) = (app.window(), app.last_copied_id()) {
+                    w.select_item(id);
+                    w.toast(&format!("{label}: copied"));
                 }
             });
             p.conversions.append(&button);
