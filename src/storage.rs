@@ -22,10 +22,12 @@ impl Storage {
     pub fn open(path: &Path) -> Result<Storage> {
         let conn = Connection::open(path)?;
         crate::config::set_private(path);
+        // secure_delete: deleted items are overwritten, not just unlinked.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS items (
                id INTEGER PRIMARY KEY,
                title TEXT NOT NULL DEFAULT '',
@@ -95,6 +97,8 @@ impl Storage {
                 number_of_copies: row.get(5)?,
                 pin: row.get(6)?,
                 ocr_text: row.get(7)?,
+                secret: None,
+                hidden: 0,
             })
         })?;
         for item in rows {
@@ -200,13 +204,23 @@ impl Storage {
     pub fn delete_unpinned(&self) -> Result<()> {
         self.conn.execute("DELETE FROM items WHERE pin IS NULL", [])?;
         self.vacuum_if_large();
+        self.scrub();
         Ok(())
     }
 
     pub fn delete_all(&self) -> Result<()> {
         self.conn.execute("DELETE FROM items", [])?;
         self.vacuum_if_large();
+        self.scrub();
         Ok(())
+    }
+
+    /// Moves everything from the write-ahead log into the database and empties the
+    /// log, so overwritten (secure-deleted) data doesn't linger in it.
+    pub fn scrub(&self) {
+        if let Err(e) = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            crate::debug!("wal checkpoint failed: {e}");
+        }
     }
 
     fn vacuum_if_large(&self) {

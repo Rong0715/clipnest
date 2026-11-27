@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -10,8 +11,9 @@ use gtk::{gdk, gio, glib};
 use crate::clipboard::x11::{self, Command, Event, WatchConfig};
 use crate::config::{self, APP_ID};
 use crate::history::{Added, History};
+use crate::inspect;
 use crate::model::{self, Content, Kind};
-use crate::notify::Notifier;
+use crate::notify::{Notice, Notifier, Urgency};
 use crate::ocr::Ocr;
 use crate::portal::GlobalShortcuts;
 use crate::settings::Settings;
@@ -33,6 +35,9 @@ pub struct App {
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     regexes: RefCell<Vec<regex::Regex>>,
     last_copied: Cell<Option<i64>>,
+    /// What the clipboard holds as far as we know (`Item::fingerprint`), so a
+    /// sensitive copy is only cleared while it is still there.
+    clipboard_now: Cell<Option<u64>>,
     ocr: RefCell<Option<Ocr>>,
     /// Tesseract languages in use, when text recognition is running.
     pub ocr_langs: RefCell<Option<String>>,
@@ -69,6 +74,7 @@ pub fn run() -> glib::ExitCode {
         hold: RefCell::new(None),
         regexes: RefCell::new(Vec::new()),
         last_copied: Cell::new(None),
+        clipboard_now: Cell::new(None),
         ocr: RefCell::new(None),
         ocr_langs: RefCell::new(None),
         tray_thumbs: RefCell::new(std::collections::HashMap::new()),
@@ -91,7 +97,9 @@ impl App {
         *self.history.borrow_mut() = History::open();
         {
             let s = self.settings.borrow().clone();
-            self.history.borrow_mut().limit_size(&s);
+            let mut history = self.history.borrow_mut();
+            history.limit_size(&s);
+            history.refresh_inspection(&s);
         }
         self.compile_regexes();
 
@@ -120,10 +128,20 @@ impl App {
     }
 
     fn shutdown(&self) {
+        // Don't leave a sensitive copy behind on the clipboard.
+        if self.clipboard_holds_secret() {
+            self.send(Command::Clear);
+            std::thread::sleep(Duration::from_millis(200));
+        }
         if self.settings.borrow().clear_on_quit {
             self.history.borrow_mut().clear();
         }
         self.tray.borrow_mut().take();
+    }
+
+    fn clipboard_holds_secret(&self) -> bool {
+        let Some(now) = self.clipboard_now.get() else { return false };
+        self.history.borrow().items().iter().any(|i| i.is_ephemeral() && i.fingerprint() == Some(now))
     }
 
     fn setup_actions(self: &Rc<Self>) {
@@ -200,7 +218,15 @@ impl App {
                 for (i, id) in pinned.iter().chain(unpinned.iter()).take(limit).enumerate() {
                     if let Some(item) = history.get(*id) {
                         let pin = item.pin.as_deref().map(|p| format!("[{p}] ")).unwrap_or_default();
-                        print(format!("{:>3}  {pin}{}", i + 1, item.summary(100)));
+                        let mut summary = item.summary(100);
+                        if item.hidden > 0 {
+                            summary = inspect::reveal(&summary);
+                        }
+                        let note = match item.expires_at() {
+                            Some(at) => format!("   (sensitive, removed in {} s)", seconds_left(at)),
+                            None => String::new(),
+                        };
+                        print(format!("{:>3}  {pin}{summary}{note}", i + 1));
                     }
                 }
             }
@@ -322,9 +348,13 @@ impl App {
     fn on_clipboard_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::Ignored => {
+                self.clipboard_now.set(None);
                 self.consume_ignore_next();
             }
-            Event::Copied { contents, application } => self.on_copied(contents, application),
+            Event::Copied { contents, application } => {
+                self.clipboard_now.set(model::fingerprint_of(&contents));
+                self.on_copied(contents, application);
+            }
             Event::Failed(e) => {
                 eprintln!("clipnest: clipboard watcher stopped: {e}; restarting");
                 self.clipboard.borrow_mut().take();
@@ -396,9 +426,156 @@ impl App {
             Added::New(id) | Added::Existing(id) => id,
         };
         self.queue_ocr(id);
+        self.schedule_expiry(id);
         self.history_changed();
-        if s.notify_on_copy {
-            self.notify_item("Copied", id);
+        self.announce_copy(id);
+    }
+
+    /// The notification for a new copy: a warning for hidden characters, a note for
+    /// sensitive items, or the usual "Copied".
+    fn announce_copy(self: &Rc<Self>, id: i64) {
+        let s = self.settings.borrow().clone();
+        let (hidden, sensitive) = {
+            let history = self.history.borrow();
+            let Some(item) = history.get(id) else { return };
+            (item.hidden > 0, item.is_ephemeral())
+        };
+        if hidden && s.warn_hidden_characters {
+            self.warn_hidden(id);
+        } else if s.notify_on_copy {
+            if sensitive {
+                self.notify_secret(id);
+            } else {
+                self.notify_item("Copied", id);
+            }
+        }
+    }
+
+    /// "API key copied — not saved to disk, removed in 30 s".
+    fn notify_secret(&self, id: i64) {
+        let shows_content = self.settings.borrow().notification_shows_content;
+        let (summary, body) = {
+            let history = self.history.borrow();
+            let Some(item) = history.get(id) else { return };
+            let Some(secret) = &item.secret else { return };
+            let when = secret
+                .expires_at
+                .map(|at| format!("Not saved to disk, removed in {} s", seconds_left(at)))
+                .unwrap_or_default();
+            let body = match (shows_content, item.is_image_item()) {
+                (true, false) => format!("{}\n{when}", item.summary(140)),
+                _ => when,
+            };
+            let summary = if item.is_image_item() {
+                format!("{} found in a copied image", secret.label)
+            } else {
+                format!("{} copied", secret.label)
+            };
+            (summary, body)
+        };
+        self.notifier.notify(&summary, &body);
+    }
+
+    /// A warning that stays until dismissed, with actions to copy the text without
+    /// the hidden characters or to look at it.
+    fn warn_hidden(self: &Rc<Self>, id: i64) {
+        let body = {
+            let history = self.history.borrow();
+            let Some(item) = history.get(id) else { return };
+            let found = inspect::find_hidden(&item.text().unwrap_or_default());
+            let mut what = inspect::describe(&found);
+            if let Some(first) = what.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{}\n{what}", inspect::reveal(&item.summary(120)))
+        };
+        let weak = Rc::downgrade(self);
+        self.notifier.show(
+            Notice {
+                summary: "Hidden characters in copied text",
+                body: &body,
+                urgency: Urgency::Critical,
+                transient: false,
+                actions: &[("clean", "Copy Without Them"), ("default", "Show")],
+            },
+            Some(Rc::new(move |action: &str, token: Option<String>| {
+                let Some(app) = weak.upgrade() else { return };
+                match action {
+                    "clean" => app.copy_cleaned(id),
+                    _ => app.show_item(id, token),
+                }
+            })),
+        );
+    }
+
+    /// Opens the window with an item selected.
+    pub fn show_item(self: &Rc<Self>, id: i64, token: Option<String>) {
+        if let Some(w) = self.window() {
+            w.present(token);
+            w.select_item(id);
+        }
+    }
+
+    // ---- sensitive items --------------------------------------------------------
+
+    /// Arranges for `expire_secrets` to run when this item's time is up.
+    fn schedule_expiry(self: &Rc<Self>, id: i64) {
+        let Some(at) = self.history.borrow().get(id).and_then(|i| i.expires_at()) else { return };
+        let delay = (at - model::now_ms()).max(0) as u64 + 50;
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+            if let Some(app) = weak.upgrade() {
+                app.expire_secrets();
+            }
+        });
+    }
+
+    /// Removes sensitive items whose time is up, and empties the clipboard if it
+    /// still holds one of them.
+    fn expire_secrets(self: &Rc<Self>) {
+        let gone = self.history.borrow_mut().expire(model::now_ms() + 20);
+        if gone.is_empty() {
+            return;
+        }
+        if let Some(now) = self.clipboard_now.get() {
+            if gone.iter().any(|i| i.fingerprint() == Some(now)) {
+                self.send(Command::Clear);
+                self.clipboard_now.set(None);
+            }
+        }
+        {
+            let mut thumbs = self.tray_thumbs.borrow_mut();
+            for item in &gone {
+                thumbs.remove(&item.id);
+            }
+        }
+        if let Some(w) = self.window() {
+            w.forget(&gone.iter().map(|i| i.id).collect::<Vec<_>>());
+        }
+        crate::debug!("removed {} sensitive item(s)", gone.len());
+        self.history_changed();
+    }
+
+    /// Deletes saved items that look sensitive. Returns how many.
+    pub fn delete_saved_secrets(self: &Rc<Self>) -> usize {
+        let count = {
+            let mut settings = self.settings.borrow_mut();
+            let count = self.history.borrow_mut().delete_saved_secrets(&mut settings);
+            settings.save();
+            count
+        };
+        self.history_changed();
+        count
+    }
+
+    /// Copies an item's text without its hidden characters (and records that copy).
+    pub fn copy_cleaned(self: &Rc<Self>, id: i64) {
+        let Some(text) = self.history.borrow().get(id).and_then(|i| i.text()) else { return };
+        let cleaned = inspect::clean(&text);
+        self.copy_text(&cleaned);
+        if self.settings.borrow().notify_on_copy {
+            let preview = self.history.borrow().get(self.last_copied.get().unwrap_or(0)).map(|i| i.summary(140));
+            self.notifier.notify("Copied without hidden characters", &preview.unwrap_or_default());
         }
     }
 
@@ -440,8 +617,10 @@ impl App {
             history.get(id).filter(|i| plain && i.is_image_item()).and_then(|i| i.ocr_text.clone())
         };
         if let Some(text) = image_text.filter(|t| !t.is_empty()) {
+            self.clipboard_now.set(Some(model::content_hash(text.as_bytes())));
             self.send(Command::SetClipboard(vec![(model::MIME_TEXT.to_owned(), Arc::new(text.into_bytes()))]));
             self.last_copied.set(Some(id));
+            self.renew_secret(id);
             return;
         }
         let contents = self.history.borrow().clipboard_contents(id, plain);
@@ -459,14 +638,26 @@ impl App {
             }
         }
         self.send(Command::SetClipboard(out));
+        self.clipboard_now.set(self.history.borrow().get(id).and_then(|i| i.fingerprint()));
         self.history.borrow_mut().bump(id);
         self.last_copied.set(Some(id));
+        self.renew_secret(id);
         self.history_changed();
+    }
+
+    /// A sensitive item copied again stays (and is cleared from the clipboard) for
+    /// another full period.
+    fn renew_secret(self: &Rc<Self>, id: i64) {
+        let s = self.settings.borrow().clone();
+        if self.history.borrow_mut().renew_secret(id, &s).is_some() {
+            self.schedule_expiry(id);
+        }
     }
 
     /// Copies arbitrary text (Enter on a search without matches) and records it.
     pub fn copy_text(self: &Rc<Self>, text: &str) {
         let data = text.as_bytes().to_vec();
+        self.clipboard_now.set(Some(model::content_hash(&data)));
         self.send(Command::SetClipboard(vec![(model::MIME_TEXT.to_owned(), Arc::new(data.clone()))]));
         let added = {
             let mut settings = self.settings.borrow_mut();
@@ -474,6 +665,7 @@ impl App {
         };
         let (Added::New(id) | Added::Existing(id)) = added;
         self.last_copied.set(Some(id));
+        self.schedule_expiry(id);
         self.history_changed();
     }
 
@@ -494,8 +686,20 @@ impl App {
         glib::spawn_future_local(async move {
             while let Ok((id, text)) = results.recv().await {
                 let Some(app) = weak.upgrade() else { break };
-                app.history.borrow_mut().set_ocr_text(id, text);
-                if let Some(w) = app.window() {
+                let s = app.settings.borrow().clone();
+                let became_sensitive = app.history.borrow_mut().set_ocr_text(id, text, &s).is_some();
+                if became_sensitive {
+                    // A screenshot of a key, say: off the disk, and out of the tray menu.
+                    app.tray_thumbs.borrow_mut().remove(&id);
+                    if let Some(w) = app.window() {
+                        w.forget(&[id]);
+                    }
+                    app.schedule_expiry(id);
+                    app.history_changed();
+                    if s.notify_on_copy {
+                        app.notify_secret(id);
+                    }
+                } else if let Some(w) = app.window() {
                     w.refresh();
                 }
             }
@@ -623,6 +827,9 @@ impl App {
         }
         if old.show_special_symbols != new.show_special_symbols {
             self.history.borrow_mut().refresh_titles(new.show_special_symbols);
+        }
+        if old.protect_secrets != new.protect_secrets {
+            self.history.borrow_mut().refresh_inspection(&new);
         }
         if old.history_size != new.history_size || old.sort_by != new.sort_by {
             self.history.borrow_mut().limit_size(&new);
@@ -793,7 +1000,8 @@ impl App {
             }
             for id in recent {
                 if let Some(item) = history.get(id) {
-                    let thumb = if item.has_image() && item.title.is_empty() {
+                    // Sensitive pictures get no thumbnail.
+                    let thumb = if item.is_image_item() && item.secret.is_none() {
                         self.tray_thumbs
                             .borrow_mut()
                             .entry(id)
@@ -807,6 +1015,10 @@ impl App {
                     };
                     let text = match &thumb {
                         Some((_, w, h)) => format!("Image ({w}×{h})"),
+                        None if item.is_image_item() && item.secret.is_some() => "Sensitive image".to_owned(),
+                        None if item.hidden > 0 && s.warn_hidden_characters => {
+                            format!("⚠ {}", inspect::reveal(&item.summary(48)))
+                        }
                         None => item.summary(48),
                     };
                     let label = match &item.pin {
@@ -836,6 +1048,11 @@ impl App {
         tray.set_menu(entries);
         tray.set_tooltip(if paused { "Clipboard history (paused)" } else { "Clipboard history" });
     }
+}
+
+/// Whole seconds until `at` (ms since the epoch), rounded up.
+pub fn seconds_left(at: i64) -> i64 {
+    ((at - model::now_ms()).max(0) + 999) / 1000
 }
 
 /// A small PNG preview for the tray menu, plus the original size.

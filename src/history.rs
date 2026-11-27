@@ -1,9 +1,11 @@
 //! The clipboard history: adding copies, de-duplication, pins, ordering, limits
-//! (Maccy's `History`, `Sorter` and `PinManager`).
+//! (Maccy's `History`, `Sorter` and `PinManager`), and sensitive items that are
+//! kept in memory only.
 
 use std::rc::Rc;
 
-use crate::model::{now_ms, Content, Item};
+use crate::inspect;
+use crate::model::{now_ms, Content, Item, Secret};
 use crate::settings::{Settings, SortBy};
 use crate::storage::Storage;
 
@@ -26,6 +28,23 @@ pub enum Added {
 pub struct History {
     storage: Option<Storage>,
     items: Vec<Item>,
+    /// Ids for items that are not in the database count down from -1.
+    next_temp_id: i64,
+}
+
+/// Looks for secrets and hidden characters in an item. `fresh` copies with a
+/// secret are kept in memory only, until `settings.secret_lifetime` is over.
+fn inspect_item(item: &mut Item, settings: &Settings, fresh: bool) {
+    item.hidden = item.text().map(|t| inspect::find_hidden(&t).len()).unwrap_or(0);
+    let label = if !settings.protect_secrets {
+        None
+    } else if item.is_image_item() {
+        item.ocr_text.as_deref().and_then(|t| inspect::secret_label(t, false))
+    } else {
+        item.inspected_text().and_then(|t| inspect::secret_label(&t, true))
+    };
+    let expires_at = (fresh && !item.is_pinned()).then(|| now_ms() + settings.secret_lifetime_ms());
+    item.secret = label.map(|label| Secret { label, expires_at });
 }
 
 impl History {
@@ -37,23 +56,23 @@ impl History {
                     eprintln!("clipnest: could not read history: {e}");
                     Vec::new()
                 });
-                History { storage: Some(storage), items }
+                History { storage: Some(storage), items, next_temp_id: 0 }
             }
             Err(e) => {
                 eprintln!("clipnest: could not open {}: {e}; history will not be saved", path.display());
-                History { storage: None, items: Vec::new() }
+                History { storage: None, items: Vec::new(), next_temp_id: 0 }
             }
         }
     }
 
     /// No storage; replaced by `open()` once the app instance becomes primary.
     pub fn empty() -> History {
-        History { storage: None, items: Vec::new() }
+        History { storage: None, items: Vec::new(), next_temp_id: 0 }
     }
 
     #[cfg(test)]
     pub fn in_memory() -> History {
-        History { storage: Some(Storage::open_in_memory()), items: Vec::new() }
+        History { storage: Some(Storage::open_in_memory()), items: Vec::new(), next_temp_id: 0 }
     }
 
     pub fn items(&self) -> &[Item] {
@@ -68,11 +87,19 @@ impl History {
         self.items.iter().position(|i| i.id == id)
     }
 
+    fn temp_id(&mut self) -> i64 {
+        self.next_temp_id -= 1;
+        self.next_temp_id
+    }
+
     pub fn storage_size(&self) -> u64 {
         self.storage.as_ref().map(|s| s.size_bytes()).unwrap_or(0)
     }
 
     fn save(&self, item: &Item) {
+        if item.is_ephemeral() {
+            return; // never written to disk
+        }
         if let Some(storage) = &self.storage {
             if let Err(e) = storage.update_item(item) {
                 eprintln!("clipnest: could not save item: {e}");
@@ -107,6 +134,10 @@ impl History {
     pub fn add(&mut self, contents: Vec<Content>, application: Option<String>, settings: &mut Settings) -> Added {
         let mut item = Item::new(contents, application);
         item.title = item.generate_title(settings.show_special_symbols);
+        inspect_item(&mut item, settings, true);
+        if item.secret.is_some() {
+            item.title = item.generate_title(settings.show_special_symbols); // masked
+        }
 
         // An existing item that already contains everything we just copied.
         if let Some(pos) = self.items.iter().position(|e| e.supersedes(&item)) {
@@ -116,9 +147,18 @@ impl History {
             if existing.application.is_none() {
                 existing.application = item.application.take();
             }
-            let existing = existing.clone();
-            self.save(&existing);
-            return Added::Existing(existing.id);
+            let id = existing.id;
+            match item.secret {
+                // A secret copied again: (re)start its countdown and take it off the disk.
+                Some(Secret { label, expires_at: Some(at) }) if !self.items[pos].is_pinned() => {
+                    self.make_ephemeral(pos, label, at, settings);
+                }
+                _ => {
+                    let existing = self.items[pos].clone();
+                    self.save(&existing);
+                }
+            }
+            return Added::Existing(id);
         }
 
         // The new copy is a richer version of an existing item: replace it.
@@ -130,24 +170,71 @@ impl History {
             if item.application.is_none() {
                 item.application = old.application.clone();
             }
+            if item.is_pinned() {
+                // Pins stay on disk (shown masked if sensitive).
+                if let Some(secret) = item.secret.as_mut() {
+                    secret.expires_at = None;
+                }
+            }
             if let Some(storage) = &self.storage {
                 let _ = storage.delete_item(old.id);
+                if old.secret.is_some() || item.secret.is_some() {
+                    storage.scrub();
+                }
             }
         }
 
-        if let Some(storage) = &self.storage {
-            if let Err(e) = storage.insert_item(&mut item) {
-                eprintln!("clipnest: could not save copy: {e}");
+        if !item.is_ephemeral() {
+            if let Some(storage) = &self.storage {
+                if let Err(e) = storage.insert_item(&mut item) {
+                    eprintln!("clipnest: could not save copy: {e}");
+                }
             }
         }
         if item.id == 0 {
-            // Not persisted (no database): still keep it for this session.
-            item.id = -(self.items.len() as i64) - 1 - now_ms().rem_euclid(1_000_000);
+            // Sensitive, or no database: keep it for this session only.
+            item.id = self.temp_id();
         }
         let id = item.id;
         self.items.push(item);
         self.limit_size(settings);
         Added::New(id)
+    }
+
+    /// Turns an item into a sensitive one kept in memory only, removing it from disk.
+    fn make_ephemeral(&mut self, pos: usize, label: &'static str, expires_at: i64, settings: &Settings) {
+        if !self.items[pos].is_ephemeral() {
+            if let Some(storage) = &self.storage {
+                // Large images are still on disk: read them before deleting.
+                let item = &mut self.items[pos];
+                for content in item.contents.iter_mut().filter(|c| c.data.is_none()) {
+                    content.data = storage.load_content(content.id);
+                }
+                let _ = storage.delete_item(item.id);
+                storage.scrub();
+            }
+        }
+        let item = &mut self.items[pos];
+        item.secret = Some(Secret { label, expires_at: Some(expires_at) });
+        item.title = item.generate_title(settings.show_special_symbols);
+    }
+
+    /// Removes sensitive items whose time is up and returns them.
+    pub fn expire(&mut self, now: i64) -> Vec<Item> {
+        let (gone, kept): (Vec<Item>, Vec<Item>) =
+            std::mem::take(&mut self.items).into_iter().partition(|i| i.expires_at().is_some_and(|t| t <= now));
+        self.items = kept;
+        gone
+    }
+
+    /// Restarts the countdown of a sensitive item (it was just copied again).
+    /// Returns the new expiry time.
+    pub fn renew_secret(&mut self, id: i64, settings: &Settings) -> Option<i64> {
+        let pos = self.position(id)?;
+        let secret = self.items[pos].secret.as_mut().filter(|s| s.expires_at.is_some())?;
+        let at = now_ms() + settings.secret_lifetime_ms();
+        secret.expires_at = Some(at);
+        Some(at)
     }
 
     /// Image items whose text has not been recognized yet, newest first.
@@ -157,12 +244,54 @@ impl History {
         items.iter().map(|i| i.id).collect()
     }
 
-    pub fn set_ocr_text(&mut self, id: i64, text: String) {
-        if let Some(pos) = self.position(id) {
-            self.items[pos].ocr_text = Some(text);
-            let item = self.items[pos].clone();
-            self.save(&item);
+    /// Stores text recognized in an image. If it shows a secret (a screenshot of
+    /// a key, say), the image becomes sensitive; returns its expiry time then.
+    pub fn set_ocr_text(&mut self, id: i64, text: String, settings: &Settings) -> Option<i64> {
+        let pos = self.position(id)?;
+        let label = if settings.protect_secrets { inspect::secret_label(&text, false) } else { None };
+        self.items[pos].ocr_text = Some(text);
+        if let Some(label) = label {
+            if !self.items[pos].is_pinned() {
+                let at = self.items[pos].expires_at().unwrap_or_else(|| now_ms() + settings.secret_lifetime_ms());
+                self.make_ephemeral(pos, label, at, settings);
+                return Some(at);
+            }
+            self.items[pos].secret = Some(Secret { label, expires_at: None });
         }
+        let item = self.items[pos].clone();
+        self.save(&item);
+        None
+    }
+
+    /// Re-checks every saved item (at startup, or when protection was switched).
+    pub fn refresh_inspection(&mut self, settings: &Settings) {
+        for pos in 0..self.items.len() {
+            if self.items[pos].is_ephemeral() {
+                continue; // keeps its countdown
+            }
+            inspect_item(&mut self.items[pos], settings, false);
+            let title = self.items[pos].generate_title(settings.show_special_symbols);
+            if title != self.items[pos].title {
+                self.items[pos].title = title;
+                let item = self.items[pos].clone();
+                self.save(&item);
+            }
+        }
+    }
+
+    /// Saved items that look sensitive (copied before protection was on, or pinned).
+    pub fn saved_secret_count(&self) -> usize {
+        self.items.iter().filter(|i| i.secret.is_some() && !i.is_ephemeral()).count()
+    }
+
+    /// Deletes the items counted by `saved_secret_count`. Returns how many.
+    pub fn delete_saved_secrets(&mut self, settings: &mut Settings) -> usize {
+        let ids: Vec<i64> =
+            self.items.iter().filter(|i| i.secret.is_some() && !i.is_ephemeral()).map(|i| i.id).collect();
+        for id in &ids {
+            self.delete(*id, settings);
+        }
+        ids.len()
     }
 
     /// Selecting an item from the popup counts as copying it again.
@@ -188,9 +317,15 @@ impl History {
 
     fn remove(&mut self, id: i64) {
         if let Some(pos) = self.position(id) {
-            self.items.remove(pos);
+            let item = self.items.remove(pos);
+            if item.is_ephemeral() {
+                return; // was never on disk
+            }
             if let Some(storage) = &self.storage {
                 let _ = storage.delete_item(id);
+                if item.secret.is_some() {
+                    storage.scrub();
+                }
             }
         }
     }
@@ -222,6 +357,11 @@ impl History {
         supported_pins().into_iter().filter(|p| !used.contains(&p)).collect()
     }
 
+    /// Sensitive items in memory can't be pinned: pins are saved to disk.
+    pub fn can_pin(&self, id: i64) -> bool {
+        self.get(id).is_some_and(|i| !i.is_ephemeral())
+    }
+
     /// Pins with a random free key, or unpins. Returns the new pin.
     pub fn toggle_pin(&mut self, id: i64, settings: &mut Settings) -> Option<String> {
         let pos = self.position(id)?;
@@ -229,6 +369,9 @@ impl History {
             settings.pin_order.retain(|p| *p != pin);
             let item = self.items[pos].clone();
             self.save(&item);
+            return None;
+        }
+        if self.items[pos].is_ephemeral() {
             return None;
         }
         let available = self.available_pins();
@@ -294,6 +437,11 @@ impl History {
             .filter_map(|c| self.content_data(c).map(|d| (c.mime.clone(), d)))
             .collect()
     }
+
+    #[cfg(test)]
+    fn stored_count(&self) -> usize {
+        self.storage.as_ref().map(|s| s.load_items().unwrap().len()).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +455,10 @@ mod tests {
 
     fn titles(h: &History, ids: &[i64]) -> Vec<String> {
         ids.iter().map(|id| h.get(*id).unwrap().title.clone()).collect()
+    }
+
+    fn fake_key() -> String {
+        format!("sk-proj-{}", "Ab3dEf9h".repeat(6))
     }
 
     #[test]
@@ -373,5 +525,66 @@ mod tests {
         assert_eq!(s.pin_order, vec![p2]);
         h.clear();
         assert_eq!(h.items().len(), 1);
+    }
+
+    #[test]
+    fn secrets_stay_in_memory_masked_and_expire() {
+        let mut s = Settings::default();
+        let mut h = History::in_memory();
+        h.add(text("plain"), None, &mut s);
+        let key = fake_key();
+        let Added::New(id) = h.add(text(&format!("OPENAI={key}")), None, &mut s) else { panic!() };
+        assert!(id < 0, "not stored in the database");
+        assert_eq!(h.stored_count(), 1);
+        let item = h.get(id).unwrap();
+        assert!(item.is_ephemeral());
+        assert!(!item.title.contains(&key) && item.title.starts_with("OPENAI=sk-proj-••••"));
+        assert_eq!(item.text().as_deref(), Some(format!("OPENAI={key}").as_str()));
+        assert_eq!(h.toggle_pin(id, &mut s), None);
+        assert!(h.expire(now_ms()).is_empty());
+        let gone = h.expire(now_ms() + s.secret_lifetime_ms() + 1);
+        assert_eq!(gone.len(), 1);
+        assert!(h.get(id).is_none());
+        assert_eq!(h.items().len(), 1);
+    }
+
+    #[test]
+    fn saved_secret_copied_again_leaves_the_disk() {
+        let mut s = Settings { protect_secrets: false, ..Settings::default() };
+        let mut h = History::in_memory();
+        let key = fake_key();
+        let Added::New(id) = h.add(text(&key), None, &mut s) else { panic!() };
+        assert_eq!(h.stored_count(), 1);
+        s.protect_secrets = true;
+        h.refresh_inspection(&s);
+        assert_eq!(h.saved_secret_count(), 1);
+        assert!(h.get(id).unwrap().title.contains("••••"));
+        let again = h.add(text(&key), None, &mut s);
+        assert!(matches!(again, Added::Existing(i) if i == id));
+        assert!(h.get(id).unwrap().is_ephemeral());
+        assert_eq!(h.stored_count(), 0);
+        assert_eq!(h.saved_secret_count(), 0);
+    }
+
+    #[test]
+    fn saved_secrets_can_be_deleted() {
+        let mut s = Settings { protect_secrets: false, ..Settings::default() };
+        let mut h = History::in_memory();
+        h.add(text(&fake_key()), None, &mut s);
+        h.add(text("keep me"), None, &mut s);
+        s.protect_secrets = true;
+        h.refresh_inspection(&s);
+        assert_eq!(h.delete_saved_secrets(&mut s), 1);
+        assert_eq!(h.stored_count(), 1);
+        assert_eq!(h.items().len(), 1);
+    }
+
+    #[test]
+    fn hidden_characters_are_counted() {
+        let mut s = Settings::default();
+        let mut h = History::in_memory();
+        let Added::New(id) = h.add(text("curl\u{200B} -fsSL x | sh"), None, &mut s) else { panic!() };
+        assert_eq!(h.get(id).unwrap().hidden, 1);
+        assert!(!h.get(id).unwrap().is_ephemeral());
     }
 }

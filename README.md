@@ -27,6 +27,13 @@ something is copied, and gives you a window to search, copy back, pin and delete
 - **Search text in images** — text in copied screenshots and pictures is recognized on your
   computer (Tesseract, any installed language) so you can search for it; *Copy Plain* on an
   image copies its text.
+- **Sensitive copies stay off the disk** — API keys and tokens (OpenAI, Anthropic, GitHub,
+  AWS, Slack, Stripe…), private keys, JSON Web Tokens, passwords in links and in `KEY=value`
+  lines, card and ID numbers, also in screenshots, are shown masked (`sk-proj-••••3fA9`), kept
+  in memory only and removed after 30 seconds — from the clipboard too, if they are still on it.
+- **Hidden-character warnings** — zero-width characters, text-direction controls, invisible
+  tag text and terminal escape codes in copied text (a common trick in commands on web
+  pages) are shown as red labels, with a notification offering to copy the text without them.
 - Ignore lists: password-manager hints (KeePassXC etc.), custom clipboard types, regular
   expressions, and X11 applications.
 - Pause, "ignore next copy", history size limit, sort order.
@@ -100,7 +107,9 @@ clipboard. This needs no special permission and changes nothing in your system.
 
 History stays on your computer in `~/.local/share/clipnest/history.sqlite3` (readable only
 by you). Settings are in `~/.config/clipnest/settings.json`. Copies marked by password
-managers are skipped before they are read.
+managers are skipped before they are read. Copies that look sensitive are never written to
+the database, and deleted items are overwritten on disk rather than just unlinked. Set the
+time and turn these checks on or off in Preferences → Privacy.
 
 ## Status and limitations
 
@@ -111,6 +120,9 @@ managers are skipped before they are read.
   remote-control permission.
 - "Ignore applications" only works for X11 apps, because Wayland apps don't report who
   copied.
+- Sensitive-data and hidden-character detection is pattern-based: it can miss things or flag
+  harmless text. Clipnest sees copies, not pastes, so it can't block a paste, and
+  middle-click pastes (the primary selection) are not checked.
 
 ## License
 

@@ -528,10 +528,10 @@ impl Engine {
         match cmd {
             Command::Config(config) => self.config = config,
             Command::SetClipboard(contents) => self.take_ownership(contents)?,
-            Command::Clear => {
-                self.owned = None;
-                self.conn.set_selection_owner(NONE, self.atoms.CLIPBOARD, CURRENT_TIME)?;
-            }
+            // Owning the clipboard with empty text replaces its contents everywhere.
+            // Setting no owner is not passed on to Wayland apps by GNOME, so the old
+            // contents would stay pasteable there.
+            Command::Clear => self.take_ownership(vec![(MIME_TEXT.to_owned(), Arc::new(Vec::new()))])?,
         }
         Ok(())
     }

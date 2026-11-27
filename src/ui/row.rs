@@ -7,6 +7,17 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, pango};
 
+/// A badge in front of the title.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RowStatus {
+    #[default]
+    None,
+    /// Looks like a password, key or token (shown masked).
+    Sensitive,
+    /// Contains hidden characters.
+    Hidden,
+}
+
 mod obj_imp {
     use super::*;
 
@@ -20,6 +31,9 @@ mod obj_imp {
         pub thumb: RefCell<Option<gdk::Texture>>,
         pub thumb_failed: Cell<bool>,
         pub app_icon: RefCell<Option<gio::Icon>>,
+        pub status: Cell<RowStatus>,
+        /// Blur the thumbnail (a picture with a secret in it).
+        pub blur: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -53,6 +67,10 @@ impl ItemObject {
     }
     pub fn set_shortcut(&self, shortcut: String) {
         *self.imp().shortcut.borrow_mut() = shortcut;
+    }
+    pub fn set_status(&self, status: RowStatus, blur: bool) {
+        self.imp().status.set(status);
+        self.imp().blur.set(blur);
     }
     pub fn set_app_icon(&self, icon: Option<gio::Icon>) {
         *self.imp().app_icon.borrow_mut() = icon;
@@ -190,12 +208,36 @@ impl RowWidget {
         imp.color.set(obj.imp().color.get());
         imp.swatch.set_visible(imp.color.get().is_some());
         imp.swatch.queue_draw();
-        match obj.imp().app_icon.borrow().as_ref() {
-            Some(icon) => {
-                imp.icon.set_from_gicon(icon);
+        imp.icon.remove_css_class("warning");
+        imp.icon.remove_css_class("dim-label");
+        match obj.imp().status.get() {
+            RowStatus::Sensitive => {
+                imp.icon.set_icon_name(Some("changes-prevent-symbolic"));
+                imp.icon.add_css_class("dim-label");
+                imp.icon.set_tooltip_text(Some("Sensitive: not shown in full"));
                 imp.icon.set_visible(true);
             }
-            None => imp.icon.set_visible(false),
+            RowStatus::Hidden => {
+                imp.icon.set_icon_name(Some("dialog-warning-symbolic"));
+                imp.icon.add_css_class("warning");
+                imp.icon.set_tooltip_text(Some("Contains hidden characters"));
+                imp.icon.set_visible(true);
+            }
+            RowStatus::None => {
+                imp.icon.set_tooltip_text(None);
+                match obj.imp().app_icon.borrow().as_ref() {
+                    Some(icon) => {
+                        imp.icon.set_from_gicon(icon);
+                        imp.icon.set_visible(true);
+                    }
+                    None => imp.icon.set_visible(false),
+                }
+            }
+        }
+        if obj.imp().blur.get() {
+            imp.thumb.add_css_class("clipnest-blur");
+        } else {
+            imp.thumb.remove_css_class("clipnest-blur");
         }
         if obj.is_image() {
             let texture = obj.thumb();

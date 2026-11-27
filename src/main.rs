@@ -4,6 +4,7 @@ mod app;
 mod clipboard;
 mod config;
 mod history;
+mod inspect;
 mod keys;
 mod model;
 mod notify;

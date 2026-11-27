@@ -67,3 +67,26 @@ row:selected .clipnest-shortcut {
 .clipnest-preview picture {
   border-radius: 6px;
 }
+
+/* "Sensitive" and "hidden characters" notices in the details pane */
+.clipnest-notice {
+  padding: 6px 6px 6px 10px;
+  border-radius: 6px;
+}
+
+.clipnest-notice.secret {
+  background-color: alpha(@accent_bg_color, 0.12);
+}
+
+.clipnest-notice.hidden-chars {
+  background-color: alpha(@warning_bg_color, 0.22);
+}
+
+.clipnest-notice.hidden-chars image {
+  color: @warning_color;
+}
+
+/* Pictures with a secret in them, until shown */
+.clipnest-blur {
+  filter: blur(12px);
+}

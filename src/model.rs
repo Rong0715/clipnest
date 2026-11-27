@@ -78,6 +78,17 @@ impl Content {
     }
 }
 
+/// Why an item is treated as sensitive (see `inspect`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Secret {
+    /// What was found, e.g. "API key".
+    pub label: &'static str,
+    /// When the item is removed (ms since the epoch); such items are never saved
+    /// to disk. `None`: an item already on disk (copied before protection was on,
+    /// or pinned), which is only shown masked.
+    pub expires_at: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     pub id: i64,
@@ -91,6 +102,20 @@ pub struct Item {
     pub pin: Option<String>,
     /// Text recognized in an image item (None = not processed yet).
     pub ocr_text: Option<String>,
+    /// Set when the item looks like a password, key or token.
+    pub secret: Option<Secret>,
+    /// Number of hidden-character runs in the text (see `inspect::find_hidden`).
+    pub hidden: usize,
+}
+
+/// Identifies what a copy put on the clipboard: its text, else its image, else
+/// its first content (the same choice as `Item::fingerprint`).
+pub fn fingerprint_of(contents: &[(String, Vec<u8>)]) -> Option<u64> {
+    let find = |mime: &str| contents.iter().find(|(m, d)| m == mime && !d.is_empty());
+    find(MIME_TEXT)
+        .or_else(|| IMAGE_MIMES.iter().find_map(|m| find(m)))
+        .or_else(|| contents.iter().find(|(_, d)| !d.is_empty()))
+        .map(|(_, d)| content_hash(d))
 }
 
 pub fn now_ms() -> i64 {
@@ -113,11 +138,38 @@ impl Item {
             number_of_copies: 1,
             pin: None,
             ocr_text: None,
+            secret: None,
+            hidden: 0,
         }
     }
 
     pub fn is_pinned(&self) -> bool {
         self.pin.is_some()
+    }
+
+    /// Kept in memory only and removed when its time is up.
+    pub fn is_ephemeral(&self) -> bool {
+        self.secret.as_ref().is_some_and(|s| s.expires_at.is_some())
+    }
+
+    pub fn expires_at(&self) -> Option<i64> {
+        self.secret.as_ref().and_then(|s| s.expires_at)
+    }
+
+    /// The text looked at for secrets (not file lists).
+    pub fn inspected_text(&self) -> Option<String> {
+        if !self.file_uris().is_empty() {
+            return None;
+        }
+        Some(self.previewable_text()).filter(|t| !t.is_empty())
+    }
+
+    /// See `fingerprint_of`.
+    pub fn fingerprint(&self) -> Option<u64> {
+        self.content(MIME_TEXT)
+            .or_else(|| self.image_content())
+            .or(self.contents.first())
+            .map(|c| c.hash)
     }
 
     pub fn content(&self, mime: &str) -> Option<&Content> {
@@ -149,7 +201,11 @@ impl Item {
     /// What search looks at: the title, or for pictures the text found in them.
     pub fn search_text(&self) -> String {
         if self.is_image_item() {
-            self.ocr_text.as_deref().map(one_line).unwrap_or_default()
+            match (&self.ocr_text, &self.secret) {
+                (Some(text), Some(_)) => one_line(&crate::inspect::mask(text, false)),
+                (Some(text), None) => one_line(text),
+                (None, _) => String::new(),
+            }
         } else {
             self.title.clone()
         }
@@ -213,12 +269,16 @@ impl Item {
         self.title.clone()
     }
 
+    /// The list title (masked for sensitive items, so they never show in full).
     pub fn generate_title(&self, show_special_symbols: bool) -> String {
         if self.has_image() && self.file_uris().is_empty() && self.text().is_none() {
             return String::new();
         }
-        let text: String = self
-            .previewable_text()
+        let mut text = self.previewable_text();
+        if self.secret.is_some() {
+            text = crate::inspect::mask(&text, true);
+        }
+        let text: String = text
             .chars()
             .filter(|c| *c != '\u{FFFC}')
             .take(1_000)

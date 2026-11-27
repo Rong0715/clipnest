@@ -139,6 +139,7 @@ pub fn build() -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
     dialog.add(&general_page(&dialog));
+    dialog.add(&privacy_page());
     dialog.add(&storage_page());
     dialog.add(&appearance_page());
     dialog.add(&ignore_page());
@@ -253,6 +254,90 @@ fn general_page(dialog: &adw::PreferencesDialog) -> adw::PreferencesPage {
     shortcut.add(&row);
     p.add(&shortcut);
     p
+}
+
+fn privacy_page() -> adw::PreferencesPage {
+    let p = page("Privacy", "security-high-symbolic");
+    let secrets = adw::PreferencesGroup::builder()
+        .title("Sensitive copies")
+        .description(
+            "API keys, tokens, private keys, passwords in links and in KEY=value lines, card \
+             and ID numbers are recognized on this computer, also in screenshots. They are \
+             shown masked, never saved to disk, and removed after a while (from the clipboard \
+             too, if they are still on it). Passwords from password managers that mark them, \
+             such as KeePassXC, are never read at all.",
+        )
+        .build();
+    secrets.add(&switch(
+        "Protect sensitive copies",
+        None,
+        |s| s.protect_secrets,
+        |s, v| s.protect_secrets = v,
+    ));
+    let lifetime = spin("Remove after", 5.0, 3600.0, |s| s.secret_lifetime, |s, v| s.secret_lifetime = v);
+    lifetime.set_subtitle("Seconds");
+    secrets.add(&lifetime);
+
+    // Items saved before protection was on (or pinned) are still on disk.
+    let saved = app().history.borrow().saved_secret_count();
+    if saved > 0 {
+        let row = adw::ActionRow::builder()
+            .title(format!("{saved} saved item{} look{} sensitive", plural(saved), if saved == 1 { "s" } else { "" }))
+            .subtitle("Copied before protection was on, or pinned. They are still on disk.")
+            .build();
+        let delete = gtk::Button::with_label("Delete…");
+        delete.add_css_class("destructive-action");
+        delete.set_valign(gtk::Align::Center);
+        let r = row.downgrade();
+        delete.connect_clicked(move |button| {
+            let dialog = adw::AlertDialog::new(
+                Some("Delete saved sensitive items?"),
+                Some("They are removed from the history and from the disk. You can't undo this."),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+            dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            dialog.set_close_response("cancel");
+            let r = r.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "delete" {
+                    let count = app().delete_saved_secrets();
+                    if let Some(row) = r.upgrade() {
+                        row.set_title(&format!("Deleted {count} item{}", plural(count)));
+                        row.set_subtitle("");
+                        if let Some(button) = row.activatable_widget() {
+                            button.set_sensitive(false);
+                        }
+                    }
+                }
+            });
+            dialog.present(Some(button));
+        });
+        row.add_suffix(&delete);
+        row.set_activatable_widget(Some(&delete));
+        secrets.add(&row);
+    }
+    p.add(&secrets);
+
+    let hidden = adw::PreferencesGroup::builder()
+        .title("Hidden characters")
+        .description(
+            "Text copied from web pages can contain characters you can't see: zero-width \
+             spaces, text-direction controls, invisible tag text or terminal escape codes. \
+             They can make a command do something other than what it shows.",
+        )
+        .build();
+    hidden.add(&switch(
+        "Warn about hidden characters",
+        Some("Mark them in the history and notify, with a button to copy the text without them"),
+        |s| s.warn_hidden_characters,
+        |s, v| s.warn_hidden_characters = v,
+    ));
+    p.add(&hidden);
+    p
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn storage_page() -> adw::PreferencesPage {

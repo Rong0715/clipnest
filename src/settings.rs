@@ -110,6 +110,13 @@ pub struct Settings {
     pub ignore_all_apps_except_listed: bool,
     pub ignored_types: Vec<String>,
     pub ignore_regexp: Vec<String>,
+    // Privacy
+    /// Keep copies that look like passwords, keys or tokens in memory only and
+    /// remove them (from the clipboard too) after `secret_lifetime` seconds.
+    pub protect_secrets: bool,
+    pub secret_lifetime: u32,
+    /// Mark and warn about invisible characters and terminal escapes in copied text.
+    pub warn_hidden_characters: bool,
     // Advanced
     pub clear_on_quit: bool,
     pub clear_system_clipboard: bool,
@@ -146,6 +153,9 @@ impl Default for Settings {
             ignore_all_apps_except_listed: false,
             ignored_types: default_ignored_types(),
             ignore_regexp: Vec::new(),
+            protect_secrets: true,
+            secret_lifetime: 30,
+            warn_hidden_characters: true,
             clear_on_quit: false,
             clear_system_clipboard: false,
             suppress_clear_alert: false,
@@ -172,7 +182,13 @@ impl Settings {
         self.image_max_height = self.image_max_height.clamp(16, 200);
         self.window_width = self.window_width.clamp(360, 4000);
         self.window_height = self.window_height.clamp(300, 4000);
+        self.secret_lifetime = self.secret_lifetime.clamp(5, 3600);
         self
+    }
+
+    /// How long a sensitive copy is kept, in milliseconds.
+    pub fn secret_lifetime_ms(&self) -> i64 {
+        self.secret_lifetime.clamp(5, 3600) as i64 * 1000
     }
 
     pub fn save(&self) {

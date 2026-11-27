@@ -4,7 +4,7 @@
 //! selection, Enter copies, Shift+Enter copies without formatting, Ctrl+1…9 copy
 //! the first nine items and Ctrl+<key> copies a pinned item.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -12,12 +12,13 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::app::app;
+use crate::app::{app, seconds_left};
+use crate::inspect;
 use crate::keys;
 use crate::model::Item;
 use crate::search;
 use crate::settings::{HighlightMatch, SearchMode, Settings};
-use crate::ui::row::{ItemObject, RowWidget};
+use crate::ui::row::{ItemObject, RowStatus, RowWidget};
 
 const TITLE_DISPLAY_CHARS: usize = 400;
 
@@ -47,6 +48,10 @@ struct State {
     thumbs: HashMap<i64, Option<gdk::Texture>>,
     search_timer: Option<glib::SourceId>,
     preedit: bool,
+    /// Sensitive item shown in full in the details pane (until another is selected).
+    revealed: Option<i64>,
+    /// Updates the "removed in N s" countdown while a sensitive item is shown.
+    countdown: Option<glib::SourceId>,
 }
 
 struct Preview {
@@ -58,6 +63,15 @@ struct Preview {
     pin: gtk::Button,
     /// Text recognized in an image.
     ocr: gtk::Label,
+    /// "Sensitive: API key…" with a show/hide toggle.
+    secret_bar: gtk::Box,
+    secret_label: gtk::Label,
+    reveal: gtk::ToggleButton,
+    /// "Hidden: 2 zero-width characters" with a button to copy the text without them.
+    hidden_bar: gtk::Box,
+    hidden_label: gtk::Label,
+    /// Highlights ⟨ZWSP⟩-style markers in the text.
+    marker_tag: gtk::TextTag,
 }
 
 pub struct MainWindow {
@@ -76,6 +90,8 @@ pub struct MainWindow {
     empty: adw::StatusPage,
     preview: Preview,
     st: RefCell<State>,
+    /// Set while the details pane updates its own widgets (ignore their signals).
+    syncing: Cell<bool>,
 }
 
 fn settings() -> Settings {
@@ -215,6 +231,7 @@ impl MainWindow {
             empty,
             preview,
             st: RefCell::new(State::default()),
+            syncing: Cell::new(false),
         });
         win.setup_factory(&factory);
         win.setup_actions();
@@ -263,6 +280,7 @@ impl MainWindow {
         };
         add("copy", Box::new(|w| w.copy_selected(false)));
         add("copy-plain", Box::new(|w| w.copy_selected(true)));
+        add("copy-clean", Box::new(|w| w.copy_clean_selected()));
         add("pin", Box::new(|w| w.toggle_pin_selected()));
         add("delete", Box::new(|w| w.delete_selected()));
         add("pin-up", Box::new(|w| w.move_pin_selected(-1)));
@@ -333,6 +351,17 @@ impl MainWindow {
             if weak.upgrade().is_some() {
                 app().set_paused(false);
             }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.preview.reveal.connect_toggled(move |button| {
+            let Some(w) = weak.upgrade() else { return };
+            if w.syncing.get() {
+                return;
+            }
+            let revealed = if button.is_active() { w.selected_id() } else { None };
+            w.st.borrow_mut().revealed = revealed;
+            w.update_preview();
         });
     }
 
@@ -420,6 +449,27 @@ impl MainWindow {
         &self.window
     }
 
+    /// Selects an item (clearing the search if it hides it).
+    pub fn select_item(&self, id: i64) {
+        let find = |w: &MainWindow| w.st.borrow().slots.iter().position(|s| s.id() == id);
+        if find(self).is_none() && !self.st.borrow().query.is_empty() {
+            self.st.borrow_mut().query.clear();
+            self.search.set_text("");
+            self.refresh_with_selection(None);
+        }
+        if let Some(idx) = find(self) {
+            self.select_index(Some(idx));
+        }
+    }
+
+    /// Drops cached pictures of items that are gone or became sensitive.
+    pub fn forget(&self, ids: &[i64]) {
+        let mut st = self.st.borrow_mut();
+        for id in ids {
+            st.thumbs.remove(id);
+        }
+    }
+
     pub fn toast(&self, text: &str) {
         let toast = adw::Toast::new(text);
         toast.set_timeout(2);
@@ -468,6 +518,8 @@ impl MainWindow {
             is_image: bool,
             color: Option<[f64; 4]>,
             pin: Option<String>,
+            status: RowStatus,
+            hidden: Vec<inspect::Hidden>,
         }
         let (pinned_rows, unpinned_rows, total) = {
             let a = app();
@@ -488,6 +540,15 @@ impl MainWindow {
                         } else {
                             (item.title.clone(), m.ranges)
                         };
+                        let warn = item.hidden > 0 && s.warn_hidden_characters;
+                        let status = if item.secret.is_some() {
+                            RowStatus::Sensitive
+                        } else if warn {
+                            RowStatus::Hidden
+                        } else {
+                            RowStatus::None
+                        };
+                        let hidden = if warn && !is_image { inspect::find_hidden(&title) } else { Vec::new() };
                         Row {
                             id: item.id,
                             title,
@@ -495,6 +556,8 @@ impl MainWindow {
                             is_image,
                             color: if s.show_hex_color_swatch { crate::model::parse_hex_color(&item.title) } else { None },
                             pin: item.pin.clone(),
+                            status,
+                            hidden,
                         }
                     })
                     .collect()
@@ -517,9 +580,10 @@ impl MainWindow {
             if let Some(thumb) = self.st.borrow().thumbs.get(&r.id) {
                 obj.set_thumb(thumb.clone());
             }
-            let markup = title_markup(&r.title, &r.ranges, s.highlight_match);
+            let markup = title_markup(&r.title, &r.ranges, s.highlight_match, &r.hidden);
             let shortcut = chars.get(&r.id).map(|c| keys::char_label(c)).unwrap_or_default();
             obj.set_display(markup, shortcut, r.color, r.is_image);
+            obj.set_status(r.status, r.is_image && r.status == RowStatus::Sensitive);
             obj
         };
         let pinned_objs: Vec<ItemObject> = pinned_rows.iter().map(make_obj).collect();
@@ -803,8 +867,23 @@ impl MainWindow {
         }
     }
 
+    fn copy_clean_selected(self: &Rc<Self>) {
+        let Some(id) = self.selected_id() else { return };
+        app().copy_cleaned(id);
+        if settings().close_after_copy {
+            self.window.close();
+        } else {
+            self.toast("Copied without hidden characters");
+            self.refresh_with_selection(None);
+        }
+    }
+
     fn toggle_pin_selected(self: &Rc<Self>) {
         let Some(id) = self.selected_id() else { return };
+        if !app().history.borrow().can_pin(id) {
+            self.toast("Sensitive items can't be pinned: pins are saved to disk");
+            return;
+        }
         app().toggle_pin(id);
         let idx = self.st.borrow().slots.iter().position(|s| s.id() == id);
         self.select_index(idx);
@@ -818,9 +897,14 @@ impl MainWindow {
 
     fn show_context_menu(self: &Rc<Self>, row: &RowWidget, x: f64, y: f64) {
         let pinned = self.selected_slot().map(|s| matches!(s, Slot::Pin(_))).unwrap_or(false);
+        let hidden = settings().warn_hidden_characters
+            && self.selected_id().is_some_and(|id| app().history.borrow().get(id).is_some_and(|i| i.hidden > 0));
         let menu = gio::Menu::new();
         menu.append(Some("Copy"), Some("win.copy"));
         menu.append(Some("Copy Without Formatting"), Some("win.copy-plain"));
+        if hidden {
+            menu.append(Some("Copy Without Hidden Characters"), Some("win.copy-clean"));
+        }
         menu.append(Some(if pinned { "Unpin" } else { "Pin" }), Some("win.pin"));
         if pinned {
             menu.append(Some("Move Up"), Some("win.pin-up"));
@@ -864,11 +948,43 @@ impl MainWindow {
         let Some(id) = self.selected_id() else {
             p.stack.set_visible_child_name("none");
             p.meta.set_text("");
+            p.secret_bar.set_visible(false);
+            p.hidden_bar.set_visible(false);
             return;
         };
+        let s = settings();
         let app = app();
         let history = app.history.borrow();
         let Some(item) = history.get(id) else { return };
+        let revealed = self.st.borrow().revealed == Some(id);
+        let masked = item.secret.is_some() && !revealed;
+
+        // Notices: sensitive item, hidden characters.
+        match &item.secret {
+            Some(secret) => {
+                p.secret_label.set_text(&secret_notice(secret.label, secret.expires_at, item.is_pinned()));
+                p.secret_bar.set_visible(true);
+                self.syncing.set(true);
+                p.reveal.set_active(revealed);
+                self.syncing.set(false);
+                p.reveal.set_icon_name(if revealed { "view-conceal-symbolic" } else { "view-reveal-symbolic" });
+                p.reveal.set_tooltip_text(Some(if revealed { "Hide" } else { "Show in full" }));
+                if item.is_ephemeral() {
+                    self.ensure_countdown();
+                }
+            }
+            None => p.secret_bar.set_visible(false),
+        }
+        let hidden = if item.hidden > 0 && s.warn_hidden_characters {
+            inspect::find_hidden(&item.text().unwrap_or_default())
+        } else {
+            Vec::new()
+        };
+        p.hidden_bar.set_visible(!hidden.is_empty());
+        if !hidden.is_empty() {
+            p.hidden_label.set_text(&format!("Hidden: {}", inspect::describe(&hidden)));
+        }
+
         let mut meta: Vec<String> = Vec::new();
         let mut showed_image = false;
         if item.has_image() && item.title.is_empty() {
@@ -878,11 +994,16 @@ impl MainWindow {
                         meta.push(format!("Dimensions: {} × {}", texture.width(), texture.height()));
                         meta.push(format!("Size: {}", glib::format_size(data.len() as u64)));
                         p.picture.set_paintable(Some(&texture));
+                        if masked {
+                            p.picture.add_css_class("clipnest-blur");
+                        } else {
+                            p.picture.remove_css_class("clipnest-blur");
+                        }
                         p.stack.set_visible_child_name("image");
                         showed_image = true;
                         match &item.ocr_text {
                             Some(t) if !t.is_empty() => {
-                                p.ocr.set_text(t);
+                                p.ocr.set_text(&if masked { inspect::mask(t, false) } else { t.clone() });
                                 p.ocr.set_visible(true);
                                 meta.push("Copy Plain copies the text in the image".to_owned());
                             }
@@ -898,11 +1019,24 @@ impl MainWindow {
             }
         }
         if !showed_image {
-            let text: String = item.previewable_text().chars().take(20_000).collect();
-            p.text.buffer().set_text(&text);
+            let full = item.previewable_text();
+            let shown = if masked { inspect::mask(&full, true) } else { full.clone() };
+            let shown: String = shown.chars().take(20_000).collect();
+            let buffer = p.text.buffer();
+            if hidden.is_empty() {
+                buffer.set_text(&shown);
+            } else {
+                // Show each hidden character as a highlighted ⟨NAME⟩.
+                let (text, marks) = inspect::reveal_marked(&shown);
+                buffer.set_text(&text);
+                for (from, to) in marks {
+                    let (a, b) = (buffer.iter_at_offset(from as i32), buffer.iter_at_offset(to as i32));
+                    buffer.apply_tag(&p.marker_tag, &a, &b);
+                }
+            }
             p.stack.set_visible_child_name("text");
             p.picture.set_paintable(gdk::Paintable::NONE);
-            meta.push(format!("{} characters", item.previewable_text().chars().count()));
+            meta.push(format!("{} characters", full.chars().count()));
         }
         if let Some(application) = &item.application {
             meta.push(format!("Application: {application}"));
@@ -917,6 +1051,39 @@ impl MainWindow {
         p.pin.set_label(if item.pin.is_some() { "Unpin" } else { "Pin" });
     }
 
+    /// Keeps the "removed in N s" text of a sensitive item current.
+    fn ensure_countdown(&self) {
+        if self.st.borrow().countdown.is_some() {
+            return;
+        }
+        let id = glib::timeout_add_local(Duration::from_millis(500), || {
+            let Some(w) = app().window() else { return glib::ControlFlow::Break };
+            if w.tick_countdown() {
+                glib::ControlFlow::Continue
+            } else {
+                w.st.borrow_mut().countdown = None;
+                glib::ControlFlow::Break
+            }
+        });
+        self.st.borrow_mut().countdown = Some(id);
+    }
+
+    fn tick_countdown(&self) -> bool {
+        if !self.window.is_visible() || !self.preview.root.get_visible() {
+            return false;
+        }
+        let Some(id) = self.selected_id() else { return false };
+        let text = {
+            let app = app();
+            let history = app.history.borrow();
+            let Some(item) = history.get(id) else { return false };
+            let Some(secret) = item.secret.as_ref().filter(|s| s.expires_at.is_some()) else { return false };
+            secret_notice(secret.label, secret.expires_at, false)
+        };
+        self.preview.secret_label.set_text(&text);
+        true
+    }
+
     /// Drops cached thumbnails (after the image height setting changed).
     pub fn clear_thumbnails(&self) {
         self.st.borrow_mut().thumbs.clear();
@@ -924,6 +1091,32 @@ impl MainWindow {
             obj.clear_thumb();
         }
     }
+}
+
+/// The text of the "sensitive item" notice in the details pane.
+fn secret_notice(label: &str, expires_at: Option<i64>, pinned: bool) -> String {
+    match expires_at {
+        Some(at) => format!("Sensitive: {label}. Not saved to disk, removed in {} s.", seconds_left(at)),
+        None if pinned => format!("Sensitive: {label}. Pinned, so it is saved on disk."),
+        None => format!("Sensitive: {label}. Saved on disk before protection was on."),
+    }
+}
+
+fn notice_bar(icon: &str, class: &str) -> (gtk::Box, gtk::Label) {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar.add_css_class("clipnest-notice");
+    bar.add_css_class(class);
+    let image = gtk::Image::from_icon_name(icon);
+    image.set_valign(gtk::Align::Center);
+    let label = gtk::Label::new(None);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    bar.append(&image);
+    bar.append(&label);
+    bar.set_visible(false);
+    (bar, label)
 }
 
 fn build_preview() -> Preview {
@@ -934,6 +1127,30 @@ fn build_preview() -> Preview {
     text.set_top_margin(6);
     text.set_left_margin(6);
     text.set_right_margin(6);
+    let marker_tag = gtk::TextTag::builder()
+        .name("hidden-character")
+        .background("#c01c28")
+        .foreground("#ffffff")
+        .weight(700)
+        .scale(0.85)
+        .build();
+    text.buffer().tag_table().add(&marker_tag);
+
+    let (secret_bar, secret_label) = notice_bar("changes-prevent-symbolic", "secret");
+    let reveal = gtk::ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Show in full")
+        .valign(gtk::Align::Center)
+        .build();
+    reveal.add_css_class("flat");
+    secret_bar.append(&reveal);
+    let (hidden_bar, hidden_label) = notice_bar("dialog-warning-symbolic", "hidden-chars");
+    let clean = gtk::Button::builder()
+        .label("Copy Without Them")
+        .action_name("win.copy-clean")
+        .valign(gtk::Align::Center)
+        .build();
+    hidden_bar.append(&clean);
     let text_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
@@ -992,10 +1209,12 @@ fn build_preview() -> Preview {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.add_css_class("clipnest-preview");
     root.set_size_request(260, -1);
+    root.append(&secret_bar);
+    root.append(&hidden_bar);
     root.append(&stack);
     root.append(&meta);
     root.append(&buttons);
-    Preview { root, stack, text, picture, meta, pin, ocr }
+    Preview { root, stack, text, picture, meta, pin, ocr, secret_bar, secret_label, reveal, hidden_bar, hidden_label, marker_tag }
 }
 
 fn format_time(ms: i64) -> String {
@@ -1030,37 +1249,53 @@ fn snippet(text: &str, ranges: &[(usize, usize)], max_chars: usize) -> (String, 
     (out, shifted)
 }
 
-/// Escapes the title for Pango and highlights the matched byte ranges.
-pub fn title_markup(title: &str, ranges: &[(usize, usize)], style: HighlightMatch) -> String {
+fn push_escaped(out: &mut String, c: char) {
+    match c {
+        '\n' | '\r' | '\t' => out.push(' '),
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        c => out.push(c),
+    }
+}
+
+/// Escapes the title for Pango, highlights the matched byte ranges and shows
+/// hidden characters as small red labels.
+pub fn title_markup(title: &str, ranges: &[(usize, usize)], style: HighlightMatch, hidden: &[inspect::Hidden]) -> String {
     let limit = title.char_indices().nth(TITLE_DISPLAY_CHARS).map(|(i, _)| i).unwrap_or(title.len());
     let text = &title[..limit];
-    let clean = |s: &str| -> String {
-        let s: String = s.chars().map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c }).collect();
-        glib::markup_escape_text(&s).to_string()
-    };
     let (open, close) = match style {
         HighlightMatch::Bold => ("<b>", "</b>"),
         HighlightMatch::Italic => ("<i>", "</i>"),
         HighlightMatch::Underline => ("<u>", "</u>"),
         HighlightMatch::Color => ("<span background=\"#ffe066\" foreground=\"#000000\">", "</span>"),
     };
-    let mut out = String::new();
-    let mut pos = 0;
-    for &(start, end) in ranges {
-        if start < pos || start >= text.len() || !text.is_char_boundary(start) {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut highlighted = false;
+    let mut skip_until = 0;
+    for (pos, c) in text.char_indices() {
+        if pos < skip_until {
             continue;
         }
-        let end = end.min(text.len());
-        if !text.is_char_boundary(end) {
+        let in_match = ranges.iter().any(|&(s, e)| pos >= s && pos < e);
+        if in_match != highlighted {
+            out.push_str(if in_match { open } else { close });
+            highlighted = in_match;
+        }
+        if let Some(h) = hidden.iter().find(|h| h.start == pos) {
+            out.push_str("<span background=\"#c01c28\" foreground=\"#ffffff\" size=\"small\" weight=\"bold\">\u{2009}");
+            h.label.chars().for_each(|c| push_escaped(&mut out, c));
+            out.push_str("\u{2009}</span>");
+            skip_until = h.end;
             continue;
         }
-        out.push_str(&clean(&text[pos..start]));
-        out.push_str(open);
-        out.push_str(&clean(&text[start..end]));
-        out.push_str(close);
-        pos = end;
+        push_escaped(&mut out, c);
     }
-    out.push_str(&clean(&text[pos..]));
+    if highlighted {
+        out.push_str(close);
+    }
     out
 }
 
@@ -1092,9 +1327,18 @@ mod tests {
 
     #[test]
     fn markup_escapes_and_highlights() {
-        let m = title_markup("a<b> & c", &[(1, 4)], HighlightMatch::Bold);
+        let m = title_markup("a<b> & c", &[(1, 4)], HighlightMatch::Bold, &[]);
         assert_eq!(m, "a<b>&lt;b&gt;</b> &amp; c");
-        let m = title_markup("x\ny", &[], HighlightMatch::Bold);
+        let m = title_markup("x\ny", &[], HighlightMatch::Bold, &[]);
         assert_eq!(m, "x y");
+    }
+
+    #[test]
+    fn markup_shows_hidden_characters() {
+        let title = "rm\u{200B} -rf";
+        let m = title_markup(title, &[(0, 2)], HighlightMatch::Bold, &inspect::find_hidden(title));
+        assert!(m.starts_with("<b>rm</b><span "), "{m}");
+        assert!(m.contains("\u{2009}ZWSP\u{2009}</span> -rf"), "{m}");
+        assert!(!m.contains('\u{200B}'));
     }
 }
