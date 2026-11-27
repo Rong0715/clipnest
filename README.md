@@ -1,4 +1,6 @@
-# Clipnest
+<p align="center"><img src="data/icons/hicolor/scalable/apps/io.github.Rong0715.Clipnest.svg" width="128" alt="Clipnest icon"></p>
+
+<h1 align="center">Clipnest</h1>
 
 > [!WARNING]
 > **This project was generated entirely by AI (Claude Opus 5.5, max effort).** It has been
