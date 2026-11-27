@@ -44,7 +44,8 @@ something is copied, and gives you a window to search, copy back, pin and delete
   (Ctrl+V, in any app) moves on to the next item. Handy for filling in forms.
 - **Quick conversions** in the details pane — Unix timestamps shown as dates, JSON formatted
   or minified, URL-encoded and Base64 text decoded, JSON Web Tokens decoded, and colors
-  (`#ff5733`, `rgb()`, `hsl()`) shown as swatches and copied as HEX, RGB or HSL.
+  (`#ff5733`, `rgb()`, `hsl()`) shown as swatches and as HEX, RGB or HSL. Results are shown with a Copy button; nothing
+  is copied until you press it.
 - Ignore lists: password-manager hints (KeePassXC etc.), custom clipboard types, regular
   expressions, and X11 applications.
 - Pause, "ignore next copy", history size limit, sort order.

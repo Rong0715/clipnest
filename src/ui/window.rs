@@ -52,6 +52,8 @@ struct State {
     revealed: Option<i64>,
     /// Updates the "removed in N s" countdown while a sensitive item is shown.
     countdown: Option<glib::SourceId>,
+    /// A conversion result being shown (item id, label, text); copied only on request.
+    conversion: Option<(i64, &'static str, String)>,
 }
 
 struct Preview {
@@ -75,6 +77,10 @@ struct Preview {
     time_note: gtk::Label,
     /// Buttons such as "Format JSON" or "Decode Base64" (each copies the result).
     conversions: gtk::Box,
+    /// The result of the conversion picked above, with a Copy button.
+    result_box: gtk::Box,
+    result_title: gtk::Label,
+    result_text: gtk::TextView,
     /// Highlights ⟨ZWSP⟩-style markers in the text.
     marker_tag: gtk::TextTag,
 }
@@ -287,6 +293,7 @@ impl MainWindow {
         add("copy-plain", Box::new(|w| w.copy_selected(true)));
         add("copy-clean", Box::new(|w| w.copy_clean_selected()));
         add("sequence", Box::new(|w| w.sequence_from_selected()));
+        add("copy-conversion", Box::new(|w| w.copy_conversion()));
         add("pin", Box::new(|w| w.toggle_pin_selected()));
         add("delete", Box::new(|w| w.delete_selected()));
         add("pin-up", Box::new(|w| w.move_pin_selected(-1)));
@@ -892,6 +899,13 @@ impl MainWindow {
         }
     }
 
+    /// Copies the conversion result shown in the details pane.
+    fn copy_conversion(self: &Rc<Self>) {
+        let Some((_, _, result)) = self.st.borrow().conversion.clone() else { return };
+        app().copy_text(&result);
+        self.toast("Copied");
+    }
+
     /// Paste in order: this item, then everything copied after it.
     fn sequence_from_selected(self: &Rc<Self>) {
         let Some(Slot::Item(id)) = self.selected_slot() else { return };
@@ -982,6 +996,7 @@ impl MainWindow {
             p.hidden_bar.set_visible(false);
             p.time_note.set_visible(false);
             p.conversions.set_visible(false);
+            p.result_box.set_visible(false);
             return;
         };
         let s = settings();
@@ -1032,6 +1047,7 @@ impl MainWindow {
 
         p.time_note.set_visible(false);
         p.conversions.set_visible(false);
+        p.result_box.set_visible(false);
         let mut meta: Vec<String> = Vec::new();
         let mut showed_image = false;
         if item.has_image() && item.title.is_empty() {
@@ -1086,6 +1102,12 @@ impl MainWindow {
             meta.push(format!("{} characters", full.chars().count()));
             if !masked && item.file_uris().is_empty() {
                 self.show_conversions(&full);
+                let shown = self.st.borrow().conversion.clone().filter(|(cid, _, _)| *cid == id);
+                if let Some((_, label, result)) = shown {
+                    p.result_title.set_text(label);
+                    p.result_text.buffer().set_text(&result);
+                    p.result_box.set_visible(true);
+                }
             }
         }
         if let Some(application) = &item.application {
@@ -1139,17 +1161,14 @@ impl MainWindow {
         }
         for c in &list {
             let button = gtk::Button::with_label(c.label);
-            button.set_tooltip_text(Some("Copy the result and show it"));
+            button.set_tooltip_text(Some("Show the result (nothing is copied)"));
             let result = c.result.clone();
             let label = c.label;
             button.connect_clicked(move |_| {
-                // Stay open and show the result (it is copied and added to the history).
-                let app = app();
-                app.copy_text(&result);
-                if let (Some(w), Some(id)) = (app.window(), app.last_copied_id()) {
-                    w.select_item(id);
-                    w.toast(&format!("{label}: copied"));
-                }
+                let Some(w) = app().window() else { return };
+                let Some(id) = w.selected_id() else { return };
+                w.st.borrow_mut().conversion = Some((id, label, result.clone()));
+                w.update_preview();
             });
             p.conversions.append(&button);
         }
@@ -1324,12 +1343,37 @@ fn build_preview() -> Preview {
     time_note.set_visible(false);
     let conversions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     conversions.set_visible(false);
+    let result_title = gtk::Label::new(None);
+    result_title.set_xalign(0.0);
+    result_title.set_hexpand(true);
+    result_title.add_css_class("heading");
+    let result_copy = gtk::Button::builder().label("Copy").action_name("win.copy-conversion").build();
+    let result_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    result_header.append(&result_title);
+    result_header.append(&result_copy);
+    let result_text = gtk::TextView::new();
+    result_text.set_editable(false);
+    result_text.set_cursor_visible(false);
+    result_text.set_wrap_mode(gtk::WrapMode::WordChar);
+    result_text.set_monospace(true);
+    let result_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(220)
+        .child(&result_text)
+        .build();
+    let result_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    result_box.add_css_class("clipnest-ocr");
+    result_box.append(&result_header);
+    result_box.append(&result_scroll);
+    result_box.set_visible(false);
     root.append(&stack);
     root.append(&time_note);
     root.append(&conversions);
+    root.append(&result_box);
     root.append(&meta);
     root.append(&buttons);
-    Preview { root, stack, text, picture, meta, pin, ocr, secret_bar, secret_label, reveal, hidden_bar, hidden_label, clean, time_note, conversions, marker_tag }
+    Preview { root, stack, text, picture, meta, pin, ocr, secret_bar, secret_label, reveal, hidden_bar, hidden_label, clean, time_note, conversions, result_box, result_title, result_text, marker_tag }
 }
 
 fn format_time(ms: i64) -> String {

@@ -726,11 +726,6 @@ impl App {
         }
     }
 
-    /// The item copied last from Clipnest itself.
-    pub fn last_copied_id(&self) -> Option<i64> {
-        self.last_copied.get()
-    }
-
     /// Button label for `copy_cleaned`, if the item has anything to clean.
     pub fn clean_label(&self, id: i64) -> Option<&'static str> {
         self.cleaned_text(id).map(|(_, label)| label)

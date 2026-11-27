@@ -244,7 +244,7 @@ pub fn color_formats(c: [f64; 4]) -> [(&'static str, String); 3] {
     let (h, s, l) = rgb_to_hsl([c[0], c[1], c[2]]);
     let (h, s, l) = (h.round(), (s * 100.0).round(), (l * 100.0).round());
     let hsl = if alpha { format!("hsla({h}, {s}%, {l}%, {a})") } else { format!("hsl({h}, {s}%, {l}%)") };
-    [("Copy as HEX", hex), ("Copy as RGB", rgb), ("Copy as HSL", hsl)]
+    [("As HEX", hex), ("As RGB", rgb), ("As HSL", hsl)]
 }
 
 /// What the copied text can be turned into.
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn colors() {
-        assert_eq!(labels("#FF5733"), vec!["Copy as RGB", "Copy as HSL"]);
+        assert_eq!(labels("#FF5733"), vec!["As RGB", "As HSL"]);
         let all = conversions("#ff5733");
         assert_eq!(all[0].result, "rgb(255, 87, 51)");
         assert_eq!(all[1].result, "hsl(11, 100%, 60%)");
